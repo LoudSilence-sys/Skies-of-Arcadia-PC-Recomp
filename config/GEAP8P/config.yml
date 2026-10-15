@@ -1,0 +1,8 @@
+# See config.example.yml for documentation.
+object_base: orig/GEAP8P
+object: sys/main.dol
+hash: 295a9fc982072bce60734eb6bdb60aec4182b702
+symbols: config/GEAP8P/symbols.txt
+splits: config/GEAP8P/splits.txt
+mw_comment_version: 8
+ldscript_template: config/GEAP8P/ldscript.tpl

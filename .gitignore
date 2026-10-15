@@ -1,0 +1,20 @@
+# generated from the game's executable - never commit
+out/
+build/
+build_win/
+soa
+*.exe
+*.o
+# game data, saves, user paths, captures
+*.dol
+*.raw
+*.wav
+*.mp3
+*.ppm
+frames/
+dsp_coef.bin
+game_path.txt
+dc_path.txt
+rt.log
+prof.txt
+*.png
