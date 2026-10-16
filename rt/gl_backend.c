@@ -13,6 +13,8 @@ u32* gx_bp_regs(void);
 void gx_tev_colors(float reg[4][4], float konst[4][4]);
 int gx_tex_info(int map, u32* key, u32* w, u32* h, u32* mode0, u32* nbytes, u32* addr);
 void gx_tex_decode(int map, u32* out);
+int gx_tex_levels(int map);
+void gx_tex_decode_level(int map, int lvl, u32* out, u32* ow, u32* oh);
 
 #define GLDEF(ret, name, args) PFN_##name name;
 GLFUNCS(GLDEF)
@@ -36,13 +38,21 @@ static const char* VS =
 static const char* FS =
 "#version 330 core\n"
 "in vec4 v_c0; in vec4 v_c1; in vec3 v_t[8];\n"
-"out vec4 o_col;\n"
+"layout(location=0, index=0) out vec4 o_col; layout(location=0, index=1) out vec4 o_src1;\n"
 "uniform sampler2D u_tex0, u_tex1, u_tex2, u_tex3, u_tex4, u_tex5, u_tex6, u_tex7;\n"
 "uniform uint u_cenv[16]; uniform uint u_aenv[16]; uniform uint u_order[8]; uniform uint u_ksel[8];\n"
-"uniform uint u_misc[4]; /* 0 genmode, 1 alpha compare, 2 dst alpha, 3 unused */\n"
+"uniform uint u_misc[6]; /* 0 genmode, 1 alpha compare, 2 no-alpha EFB, 3 dst alpha (BP 0x42), 4 ztex1 bias, 5 ztex2 */\n"
 "uniform vec4 u_reg[4]; uniform vec4 u_konst[4];\n"
+"uniform uint u_ind[40]; uniform int u_imtx[24]; /* ind: 0-15 IND_CMD, 16 IREF, 17-18 ind scale, 20-35 texcoord sizes s,t; imtx: 3 x (ma mc me w, mb md mf w) */\n"
+"uniform float u_fogk[10]; uniform vec2 u_fogrc; /* fog range adjust: K table, (center, viewport width) */\n"
+"uniform vec4 u_fog; uniform vec3 u_fogcol; uniform uint u_fogmode; /* fog: A, C, B magnitude, B shift; mode = fsel | proj<<3 */\n"
 "vec4 samp(uint m, vec2 uv){ switch(m){ case 0u: return texture(u_tex0,uv); case 1u: return texture(u_tex1,uv); case 2u: return texture(u_tex2,uv); case 3u: return texture(u_tex3,uv);\n"
 "  case 4u: return texture(u_tex4,uv); case 5u: return texture(u_tex5,uv); case 6u: return texture(u_tex6,uv); default: return texture(u_tex7,uv);} }\n"
+"ivec2 tsize(uint m){ switch(m){ case 0u: return textureSize(u_tex0,0); case 1u: return textureSize(u_tex1,0); case 2u: return textureSize(u_tex2,0); case 3u: return textureSize(u_tex3,0);\n"
+"  case 4u: return textureSize(u_tex4,0); case 5u: return textureSize(u_tex5,0); case 6u: return textureSize(u_tex6,0); default: return textureSize(u_tex7,0);} }\n"
+"vec4 sampi(uint m, ivec2 uv){ return samp(m, vec2(uv)/(vec2(tsize(m))*128.0)); }\n"
+"ivec2 fuv(uint tc){ vec3 t=v_t[tc]; vec2 uv=(t.z==0.0)?t.xy:t.xy/t.z; return ivec2(uv*vec2(float(u_ind[20u+2u*tc]),float(u_ind[21u+2u*tc]))*128.0); }\n"
+"ivec2 mshift(ivec2 v, int w){ return (w>=0)?(v>>w):(v<<(-w)); }\n"
 "vec4 swz(vec4 c, uint t){ uint a=u_ksel[t*2u], b=u_ksel[t*2u+1u]; return vec4(c[a&3u], c[(a>>2)&3u], c[b&3u], c[(b>>2)&3u]); }\n"
 "float kfrac(uint s){ return (s<8u) ? (8.0-float(s))/8.0 : 1.0; }\n"
 "vec3 kcol(uint s){ if(s<8u) return vec3(kfrac(s)); if(s>=12u && s<16u) return u_konst[s-12u].rgb; if(s>=16u) return vec3(u_konst[(s-16u)&3u][(s-16u)>>2]); return vec3(1.0); }\n"
@@ -53,13 +63,32 @@ static const char* FS =
 "  vec4 r[4]; r[0]=u_reg[0]; r[1]=u_reg[1]; r[2]=u_reg[2]; r[3]=u_reg[3];\n"
 "  uint ns=((u_misc[0]>>10)&15u)+1u;\n"
 "  const vec3 bias3=vec3(0.0); float bias[3]=float[3](0.0,0.5,-0.5); float scl[4]=float[4](1.0,2.0,4.0,0.5);\n"
+"  uint ntg=u_misc[0]&15u, nind=(u_misc[0]>>16)&7u; ivec3 iind[4]; ivec2 tevc=ivec2(0); int abump=0;\n"
+"  for(uint i=0u;i<4u;i++){ iind[i]=ivec3(0); if(i>=nind) continue; uint im=(u_ind[16]>>(6u*i))&7u, itc=(u_ind[16]>>(6u*i+3u))&7u; if(itc>=ntg) itc=0u;\n"
+"    uint sc=u_ind[17u+(i>>1)]>>((i&1u)*8u); ivec2 c=fuv(itc)>>ivec2(int(sc&15u),int((sc>>4)&15u)); ivec4 t=ivec4(floor(sampi(im,c)*255.0+0.5)); iind[i]=ivec3(t.a,t.b,t.g); }\n"
+"  vec4 lastraw=vec4(0.0);\n"
 "  for(uint s=0u;s<ns;s++){\n"
 "    uint o=u_order[s>>1]; if((s&1u)!=0u) o>>=12;\n"
 "    uint tmap=o&7u, tcrd=(o>>3)&7u, ten=(o>>6)&1u, chan=(o>>7)&7u;\n"
 "    uint ce=u_cenv[s], ae=u_aenv[s];\n"
-"    vec4 texc=vec4(1.0), rasc=vec4(0.0);\n"
-"    if(ten!=0u){ vec3 t=v_t[tcrd]; float q=(t.z==0.0)?1.0:t.z; texc=swz(samp(tmap,t.xy/q),(ae>>2)&3u); }\n"
+"    vec4 texc=vec4(1.0), rasc=vec4(0.0); uint tcu=(tcrd<ntg)?tcrd:0u; uint ic=u_ind[s];\n"
+"    if(ic!=0u){ uint bt=ic&3u, fmt=(ic>>2)&3u, bia=(ic>>4)&7u, bs=(ic>>7)&3u, mi=(ic>>9)&3u, mid=(ic>>11)&3u, sw=(ic>>13)&7u, tw=(ic>>16)&7u;\n"
+"      ivec2 fp=fuv(tcu); bool has=bt<nind; ivec3 iv=iind[bt&3u];\n"
+"      if(has && bs!=0u){ int comp=(bs==1u)?iv.x:(bs==2u)?iv.y:iv.z; int sh=(fmt==0u)?0:int(6u-fmt); abump=(comp<<sh)&248; }\n"
+"      ivec2 tr=ivec2(0);\n"
+"      if(has && mi!=0u){ ivec3 crd=iv>>((fmt==0u)?0:int(fmt+2u)); int ba=(fmt==0u)?-128:1; if((bia&1u)!=0u) crd.x+=ba; if((bia&2u)!=0u) crd.y+=ba; if((bia&4u)!=0u) crd.z+=ba;\n"
+"        int b0=int(mi-1u)*8; int w=u_imtx[b0+3];\n"
+"        if(mid==0u) tr=ivec2(u_imtx[b0]*crd.x+u_imtx[b0+1]*crd.y+u_imtx[b0+2]*crd.z, u_imtx[b0+4]*crd.x+u_imtx[b0+5]*crd.y+u_imtx[b0+6]*crd.z)>>3;\n"
+"        else if(mid==1u) tr=(fp*crd.xx)>>8; else if(mid==2u) tr=(fp*crd.yy)>>8;\n"
+"        tr=mshift(tr,w); }\n"
+"      ivec2 wc; wc.x=(sw==0u)?fp.x:(sw>=6u)?0:(fp.x&(((256>>int(sw-1u))<<7)-1)); wc.y=(tw==0u)?fp.y:(tw>=6u)?0:(fp.y&(((256>>int(tw-1u))<<7)-1));\n"
+"      tevc=(((ic>>20)&1u)!=0u)?(tevc+wc+tr):(wc+tr); tevc=(tevc<<8)>>8;\n"
+"      if(ten!=0u && ntg>0u) texc=swz(sampi(tmap,tevc),(ae>>2)&3u); }\n"
+"    else { if(ten!=0u && ntg>0u){ vec3 t=v_t[tcu]; float q=(t.z==0.0)?1.0:t.z; texc=swz(samp(tmap,t.xy/q),(ae>>2)&3u); tevc=fuv(tcu); } }\n"
+"    if(ntg==0u) texc=vec4(0.0);\n"
+"    if(ten!=0u) lastraw=texc;\n"
 "    if(chan==0u) rasc=swz(clamp(v_c0,0.0,1.0),ae&3u); else if(chan==1u) rasc=swz(clamp(v_c1,0.0,1.0),ae&3u);\n"
+"    else if(chan==5u) rasc=vec4(float(abump)/255.0); else if(chan==6u) rasc=vec4(float(abump|(abump>>5))/255.0);\n"
 "    uint ks=u_ksel[s>>1]; uint kcs=((s&1u)!=0u)?((ks>>14)&31u):((ks>>4)&31u); uint kas=((s&1u)!=0u)?((ks>>19)&31u):((ks>>9)&31u);\n"
 "    vec3 kc=kcol(kcs); float ka=kalp(kas);\n"
 "    vec3 ci[4]; uint cs[4]=uint[4]((ce>>12)&15u,(ce>>8)&15u,(ce>>4)&15u,ce&15u);\n"
@@ -93,11 +122,25 @@ static const char* FS =
 "  bool p0=acmp((ac>>16)&7u,a8,float(ac&255u)), p1=acmp((ac>>19)&7u,a8,float((ac>>8)&255u)); uint lg=(ac>>22)&3u;\n"
 "  bool pass=(lg==0u)?(p0&&p1):(lg==1u)?(p0||p1):(lg==2u)?(p0!=p1):(p0==p1);\n"
 "  if(!pass) discard;\n"
+"  float zout=gl_FragCoord.z; uint zop=(u_misc[5]>>2)&3u;\n"
+"  if(zop!=0u){ uvec4 t=uvec4(floor(clamp(lastraw,0.0,1.0)*255.0+0.5)); uint zt=u_misc[5]&3u; uint zc;\n"
+"    if(zt==0u) zc=t.a; else if(zt==1u) zc=t.r+t.a*256u; else zc=t.r*65536u+t.g*256u+t.b; zc+=u_misc[4];\n"
+"    if(zop==1u) zc+=uint(clamp(gl_FragCoord.z,0.0,1.0)*16777215.0+0.5); zout=float(zc&0xFFFFFFu)/16777215.0; }\n"
+"  gl_FragDepth=zout;\n"
+"  uint fsel=u_fogmode&7u;\n"
+"  if(fsel>=2u){ uint zc=uint(clamp(gl_FragCoord.z,0.0,1.0)*16777215.0+0.5); float ze;\n"
+"    if((u_fogmode&8u)==0u){ float den=u_fog.z-float(zc>>uint(u_fog.w)); ze=(den!=0.0)?(u_fog.x*16777216.0)/den:0.0; } else ze=u_fog.x*float(zc)/16777216.0;\n"
+"    if((u_fogmode&16u)!=0u){ float off=(2.0*(gl_FragCoord.x/u_fogrc.y))-1.0-u_fogrc.x; float fi=clamp(9.0-abs(off)*9.0,0.0,9.0); uint il=uint(fi); uint iu=min(il+1u,9u);\n"
+"      float k=mix(u_fogk[il],u_fogk[iu],fract(fi)); if(k>0.0) ze*=sqrt(off*off+k*k)/k; }\n"
+"    float fog=clamp(ze-u_fog.y,0.0,1.0);\n"
+"    if(fsel==4u) fog=1.0-exp2(-8.0*fog); else if(fsel==5u) fog=1.0-exp2(-8.0*fog*fog); else if(fsel==6u) fog=exp2(-8.0*(1.0-fog)); else if(fsel==7u){ fog=1.0-fog; fog=exp2(-8.0*fog*fog); }\n"
+"    float ifog=floor(fog*256.0+0.5); vec3 pc=floor(c.rgb*255.0+0.5); c.rgb=floor((pc*(256.0-ifog)+u_fogcol*255.0*ifog)/256.0)/255.0; }\n"
+"  o_src1=c; if((u_misc[3]&0x100u)!=0u) c.a=float(u_misc[3]&255u)/255.0; if(u_misc[2]!=0u) c.a=1.0;\n"
 "  o_col=c;\n"
 "}\n";
 
 static GLuint g_prog, g_vao, g_vbo, g_fbo, g_fbtex, g_fbdepth;
-static GLint u_cenv, u_aenv, u_order, u_ksel, u_misc, u_reg, u_konst, u_tex[8];
+static GLint u_cenv, u_aenv, u_order, u_ksel, u_misc, u_reg, u_konst, u_tex[8], u_fog, u_fogcol, u_fogmode, u_ind, u_imtx, u_fogk, u_fogrc;
 int g_gl_ok;
 
 #define EFB_W 640
@@ -141,6 +184,9 @@ int gl_init(void) {
     u_cenv = glGetUniformLocation(g_prog, "u_cenv"); u_aenv = glGetUniformLocation(g_prog, "u_aenv");
     u_order = glGetUniformLocation(g_prog, "u_order"); u_ksel = glGetUniformLocation(g_prog, "u_ksel");
     u_misc = glGetUniformLocation(g_prog, "u_misc"); u_reg = glGetUniformLocation(g_prog, "u_reg"); u_konst = glGetUniformLocation(g_prog, "u_konst");
+    u_fog = glGetUniformLocation(g_prog, "u_fog"); u_fogcol = glGetUniformLocation(g_prog, "u_fogcol"); u_fogmode = glGetUniformLocation(g_prog, "u_fogmode");
+    u_fogk = glGetUniformLocation(g_prog, "u_fogk"); u_fogrc = glGetUniformLocation(g_prog, "u_fogrc");
+    u_ind = glGetUniformLocation(g_prog, "u_ind"); u_imtx = glGetUniformLocation(g_prog, "u_imtx");
     for (int i = 0; i < 8; i++) { char n[16]; snprintf(n, sizeof n, "u_tex%d", i); u_tex[i] = glGetUniformLocation(g_prog, n); glUniform1i(u_tex[i], i); }
     glGenVertexArrays(1, &g_vao); glBindVertexArray(g_vao);
     glGenBuffers(1, &g_vbo); glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
@@ -167,7 +213,7 @@ int gl_init(void) {
 }
 
 /* ---------------- texture cache ---------------- */
-typedef struct { u32 key[4]; u32 hash; GLuint tex; u32 w, h; u64 frame; } TexEnt;
+typedef struct { u32 key[4]; u32 hash; GLuint tex; u32 w, h; u64 frame; int levels; } TexEnt;
 #define TCACHE 1024
 static TexEnt g_tc[TCACHE];
 u64 g_gl_frame;
@@ -176,13 +222,14 @@ static u32 fnv(const u8* p, u32 n) { u32 h = 2166136261u; for (u32 i = 0; i < n;
 static void bind_tex(int map) {
     u32 key[4], w, h, mode0, nbytes, addr;
     gx_tex_info(map, key, &w, &h, &mode0, &nbytes, &addr);
+    int levels = gx_tex_levels(map);
     u32 a = addr & 0x01FFFFFF; if (a + nbytes > RAM_SIZE) nbytes = RAM_SIZE - a;
     u32 hash = fnv(g_ram + a, nbytes & ~3u) ^ key[3];
     u32 slot = (key[0] * 2654435761u ^ key[1] * 40503u ^ key[2]) % TCACHE;
     TexEnt* e = 0;
     for (int probe = 0; probe < 8; probe++) {
         TexEnt* t = &g_tc[(slot + probe) % TCACHE];
-        if (t->tex && !memcmp(t->key, key, 12) && t->hash == hash) { e = t; break; }
+        if (t->tex && !memcmp(t->key, key, 12) && t->hash == hash && t->levels >= levels) { e = t; break; }
     }
     if (!e) {
         TexEnt* t = &g_tc[slot]; u64 oldest = ~0ull;
@@ -193,7 +240,12 @@ static void bind_tex(int map) {
         if (!t->tex) glGenTextures(1, &t->tex);
         glActiveTexture(GL_TEXTURE0 + map); glBindTexture(GL_TEXTURE_2D, t->tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-        memcpy(t->key, key, 12); t->hash = hash; t->w = w; t->h = h; e = t;
+        for (int l = 1; l < levels; l++) {
+            u32 lw, lh; gx_tex_decode_level(map, l, buf, &lw, &lh);
+            glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+        }
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+        memcpy(t->key, key, 12); t->hash = hash; t->w = w; t->h = h; t->levels = levels; e = t;
     }
     e->frame = g_gl_frame;
     glActiveTexture(GL_TEXTURE0 + map); glBindTexture(GL_TEXTURE_2D, e->tex);
@@ -201,9 +253,18 @@ static void bind_tex(int map) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wraps[mode0 & 3]);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wraps[(mode0 >> 2) & 3]);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (mode0 >> 4) & 1 ? GL_LINEAR : GL_NEAREST);
-    u32 mf = (mode0 >> 5) & 7;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (mf == 0 || mf == 1 || mf == 2) ? GL_NEAREST : GL_LINEAR);
-    if (mf == 4 || mf == 5 || mf == 6) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    {   /* min filter: bit7 linear, bits5-6 mip mode (0 none, 1 point, 2 linear); LOD range/bias from mode0/mode1 */
+        int lin = (mode0 >> 7) & 1, mip = (mode0 >> 5) & 3;
+        GLint f = lin ? GL_LINEAR : GL_NEAREST;
+        if (levels > 1 && mip) f = lin ? (mip == 2 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST) : (mip == 2 ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+        if (levels > 1) {
+            int b = map < 4 ? map : map - 4 + 0x20; u32 m1 = gx_bp_regs()[0x84 + b];
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, (m1 & 0xFF) / 16.f);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, ((m1 >> 8) & 0xFF) / 16.f);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, (float)(s8)((mode0 >> 9) & 0xFF) / 32.f);
+        }
+    }
 }
 
 /* ---------------- batching ---------------- */
@@ -218,11 +279,11 @@ void gl_vertex(const float* pos4, const float* c0, const float* c1, const float 
 
 static GLenum gl_src(u32 f, int noalpha) {
     switch (f) { case 0: return GL_ZERO; case 1: return GL_ONE; case 2: return GL_DST_COLOR; case 3: return GL_ONE_MINUS_DST_COLOR;
-    case 4: return GL_SRC_ALPHA; case 5: return GL_ONE_MINUS_SRC_ALPHA; case 6: return noalpha ? GL_ONE : GL_DST_ALPHA; default: return noalpha ? GL_ZERO : GL_ONE_MINUS_DST_ALPHA; }
+    case 4: return GL_SRC1_ALPHA; case 5: return GL_ONE_MINUS_SRC1_ALPHA; case 6: return noalpha ? GL_ONE : GL_DST_ALPHA; default: return noalpha ? GL_ZERO : GL_ONE_MINUS_DST_ALPHA; }
 }
 static GLenum gl_dst(u32 f, int noalpha) {
     switch (f) { case 0: return GL_ZERO; case 1: return GL_ONE; case 2: return GL_SRC_COLOR; case 3: return GL_ONE_MINUS_SRC_COLOR;
-    case 4: return GL_SRC_ALPHA; case 5: return GL_ONE_MINUS_SRC_ALPHA; case 6: return noalpha ? GL_ONE : GL_DST_ALPHA; default: return noalpha ? GL_ZERO : GL_ONE_MINUS_DST_ALPHA; }
+    case 4: return GL_SRC1_ALPHA; case 5: return GL_ONE_MINUS_SRC1_ALPHA; case 6: return noalpha ? GL_ONE : GL_DST_ALPHA; default: return noalpha ? GL_ZERO : GL_ONE_MINUS_DST_ALPHA; }
 }
 
 void gl_flush(void) {
@@ -235,11 +296,48 @@ void gl_flush(void) {
     glUniform1uiv(u_cenv, 16, cenv); glUniform1uiv(u_aenv, 16, aenv);
     glUniform1uiv(u_order, 8, bp + 0x28); glUniform1uiv(u_ksel, 8, bp + 0xF6);
     int noalpha = (bp[0x43] & 7) != 1;
-    u32 misc[4] = { bp[0x00], bp[0xF3], (u32)noalpha, 0 }; glUniform1uiv(u_misc, 4, misc);
+    u32 misc[6] = { bp[0x00], bp[0xF3], (u32)noalpha, bp[0x42], bp[0xF4] & 0xFFFFFF, bp[0xF5] }; glUniform1uiv(u_misc, 6, misc);
     float reg[4][4], konst[4][4]; gx_tev_colors(reg, konst);
     glUniform4fv(u_reg, 4, &reg[0][0]); glUniform4fv(u_konst, 4, &konst[0][0]);
-    /* textures used by enabled TEV stages */
+    {   /* fog (BP 0xEE-0xF2), as Dolphin */
+        u32 a = bp[0xEE], c3 = bp[0xF1], col = bp[0xF2];
+        u32 ai = ((a >> 19) & 1) << 31 | ((a >> 11) & 0xFF) << 23 | (a & 0x7FF) << 12, ci = ((c3 >> 19) & 1) << 31 | ((c3 >> 11) & 0xFF) << 23 | (c3 & 0x7FF) << 12;
+        float af, cf; memcpy(&af, &ai, 4); memcpy(&cf, &ci, 4);
+        u32 fsel = (c3 >> 21) & 7, proj = (c3 >> 20) & 1;
+        if (((a >> 11) & 0xFF) == 0xFF || ((c3 >> 11) & 0xFF) == 0xFF) fsel = 0;   /* NaN/inf parameters: off */
+        float fv[4] = {af, cf, (float)(bp[0xEF] & 0xFFFFFF), (float)(bp[0xF0] & 31)};
+        float fc[3] = {((col >> 16) & 255) / 255.f, ((col >> 8) & 255) / 255.f, (col & 255) / 255.f};
+        u32 rng = 0;
+        if ((bp[0xE8] >> 10) & 1) {   /* range adjust, as Dolphin */
+            extern float gx_viewport_wd(void);
+            float wd = gx_viewport_wd(); if (wd < 0) wd = -wd; if (wd < 1) wd = 320;
+            float cen = (float)((int)(bp[0xE8] & 0x3FF) - 342) / (2.0f * wd) * 2.0f - 1.0f;
+            float k[10]; for (int i = 0; i < 5; i++) { u32 e = bp[0xE9 + i]; k[2 * i] = ((e >> 12) & 0xFFF) / 256.f * 4.f; k[2 * i + 1] = (e & 0xFFF) / 256.f * 4.f; }
+            float rc[2] = {cen, 2.0f * wd};
+            glUniform1fv(u_fogk, 10, k); glUniform2fv(u_fogrc, 1, rc); rng = 16;
+        }
+        glUniform4fv(u_fog, 1, fv); glUniform3fv(u_fogcol, 1, fc); glUniform1ui(u_fogmode, fsel | proj << 3 | rng);
+    }
+    {   /* indirect texturing state */
+        u32 ind[40] = {0};
+        for (int i = 0; i < 16; i++) ind[i] = bp[0x10 + i] & 0x1FFFFF;
+        ind[16] = bp[0x27]; ind[17] = bp[0x25]; ind[18] = bp[0x26];
+        for (int i = 0; i < 8; i++) { ind[20 + 2 * i] = (bp[0x30 + 2 * i] & 0xFFFF) + 1; ind[21 + 2 * i] = (bp[0x31 + 2 * i] & 0xFFFF) + 1; }
+        GLint mt[24];
+        for (int m = 0; m < 3; m++) {
+            u32 a = bp[0x06 + 3 * m], b = bp[0x07 + 3 * m], c = bp[0x08 + 3 * m];
+#define S11(x) ((GLint)((x) << 21) >> 21)
+            int scale = ((a >> 22) & 3) | ((b >> 22) & 3) << 2 | ((c >> 22) & 3) << 4;
+            GLint* r = mt + 8 * m;
+            r[0] = S11(a & 0x7FF); r[1] = S11(b & 0x7FF); r[2] = S11(c & 0x7FF); r[3] = 17 - scale;
+            r[4] = S11((a >> 11) & 0x7FF); r[5] = S11((b >> 11) & 0x7FF); r[6] = S11((c >> 11) & 0x7FF); r[7] = 17 - scale;
+#undef S11
+        }
+        glUniform1uiv(u_ind, 40, ind); glUniform1iv(u_imtx, 24, mt);
+    }
+    /* textures used by enabled TEV stages and indirect stages */
     int ns = ((bp[0x00] >> 10) & 15) + 1; u32 used = 0;
+    { int nind = (bp[0x00] >> 16) & 7; static int logged; if (nind && logged < 8) { logged++; rt_log("GL: indirect draw nind=%d iref=%06X cmd0=%06X cmd1=%06X mtx0=%06X %06X %06X\n", nind, bp[0x27], bp[0x10], bp[0x11], bp[0x06], bp[0x07], bp[0x08]); } for (int i = 0; i < nind && i < 4; i++) used |= 1u << ((bp[0x27] >> (6 * i)) & 7); }
     for (int s = 0; s < ns; s++) { u32 o = bp[0x28 + s / 2]; if (s & 1) o >>= 12; if ((o >> 6) & 1) used |= 1u << (o & 7); }
     for (int m = 0; m < 8; m++) if (used & (1u << m)) bind_tex(m);
     /* depth */
@@ -274,6 +372,14 @@ void gl_read_efb(u32* dst, int x, int y, int w, int h) {
     static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
     glReadPixels(x, EFB_H - y - h, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
     for (int r = 0; r < h; r++) memcpy(dst + (size_t)(y + r) * EFB_W + x, tmp + (size_t)(h - 1 - r) * w, (size_t)w * 4);
+}
+/* read EFB depth (24-bit) into a buffer laid out EFB_W wide */
+void gl_read_efb_depth(u32* dst, int x, int y, int w, int h) {
+    gl_flush();
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
+    glReadPixels(x, EFB_H - y - h, w, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, tmp);
+    for (int r = 0; r < h; r++) { const u32* s = tmp + (size_t)(h - 1 - r) * w; u32* d = dst + (size_t)(y + r) * EFB_W + x; for (int i = 0; i < w; i++) d[i] = s[i] >> 8; }
 }
 void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alpha, int depth) {
     gl_flush(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_BLEND);

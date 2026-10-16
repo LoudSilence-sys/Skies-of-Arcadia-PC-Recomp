@@ -1,8 +1,9 @@
 #!/bin/sh
 # build_win.sh: cross-compile the Windows executable with llvm-mingw
 set -e
-cd /home/claude/recomp
-T=/home/claude/decomp/tools/mingw/llvm-mingw-20250924-ucrt-ubuntu-22.04-x86_64/bin
+cd "$(dirname "$0")"
+# LLVM_MINGW: path to an llvm-mingw toolchain (https://github.com/mstorsjo/llvm-mingw)
+T=${LLVM_MINGW:-/home/claude/decomp/tools/mingw/llvm-mingw-20250924-ucrt-ubuntu-22.04-x86_64}/bin
 CC=$T/x86_64-w64-mingw32-clang
 mkdir -p build_win
 cp rt/rt.h out/

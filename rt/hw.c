@@ -97,6 +97,12 @@ static void disc_read(u32 dst, u32 off, u32 len) {
 }
 
 /* ======================= DI (disc interface) ======================= */
+/* Commands complete asynchronously (TSTART stays set, then TCINT), as on hardware: the data is
+   copied at once but the interrupt arrives after a short delay (0.2 ms + ~40 MB/s), so the DVD
+   library never sees a transfer finish inside the register write that started it. SOA_DIFAST=1: instant. */
+u64 host_tb(void);
+static int g_di_pending; static u64 g_di_done_at;
+static void di_complete(void) { w32reg(0x601C, r32reg(0x601C) & ~1u); w32reg(0x6000, r32reg(0x6000) | 0x10); }
 static void di_exec(void) {
     u32 cmd = r32reg(0x6008), a1 = r32reg(0x600C), a2 = r32reg(0x6010);
     u32 mar = r32reg(0x6014), len = r32reg(0x6018);
@@ -114,8 +120,11 @@ static void di_exec(void) {
     case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xAB: w32reg(0x6020, 0); break;
     default: rt_log("DI: unknown command %08X %08X %08X\n", cmd, a1, a2); break;
     }
-    w32reg(0x601C, r32reg(0x601C) & ~1u);
-    w32reg(0x6000, r32reg(0x6000) | 0x10);
+    static int fast = -1; if (fast < 0) fast = getenv("SOA_DIFAST") != 0;
+    if (fast) { di_complete(); return; }
+    u32 bytes = (op == 0xA8) ? len : 32;
+    g_di_done_at = host_tb() + 40500000ull * 2 / 10000 + 40500000ull * bytes / 40000000ull;
+    g_di_pending = 1;
 }
 
 /* ======================= VI ======================= */
@@ -346,6 +355,7 @@ int ai_dma_tick(int rate, u16* csr);
 void ai_dma_control(u32 start, u16 ctl, u32 aicr);
 void hw_tick(void) {
     mc_tick();
+    if (g_di_pending && (s64)(host_tb() - g_di_done_at) >= 0) { g_di_pending = 0; di_complete(); }
     if (g_ar_pending && (s64)(host_tb() - g_ar_done_at) >= 0) { g_ar_pending = 0; R16REG(0x500A) = (R16REG(0x500A) & ~0x200) | 0x20; }
     ai_dma_tick((r32reg(0x6C00) & 0x40) ? 32000 : 48000, &R16REG(0x500A));
     if (g_si_pending && (s64)(host_tb() - g_si_done_at) >= 0) { g_si_pending = 0; w32reg(0x6434, (r32reg(0x6434) & ~1u) | 0x80000000u); }

@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh: regenerate (if needed) and build the native executable
 set -e
-cd /home/claude/recomp
+cd "$(dirname "$0")"
 mkdir -p build
 cp rt/rt.h out/
 for f in out/gen_*.c out/table.c; do o=build/$(basename $f .c).o; [ $o -nt $f ] && [ $o -nt rt/rt.h ] || echo $f; done | xargs -r -P 2 -I{} sh -c 'gcc -O1 -w -c {} -o build/$(basename {} .c).o'

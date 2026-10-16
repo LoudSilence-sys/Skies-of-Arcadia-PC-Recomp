@@ -25,6 +25,8 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
 #define GL_DST_ALPHA 0x0304
 #define GL_ONE_MINUS_DST_ALPHA 0x0305
+#define GL_SRC1_ALPHA 0x8589
+#define GL_ONE_MINUS_SRC1_ALPHA 0x88FB
 #define GL_DST_COLOR 0x0306
 #define GL_ONE_MINUS_DST_COLOR 0x0307
 #define GL_DEPTH_TEST 0x0B71
@@ -38,6 +40,13 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
 #define GL_NEAREST 0x2600
 #define GL_LINEAR 0x2601
 #define GL_LINEAR_MIPMAP_LINEAR 0x2703
+#define GL_NEAREST_MIPMAP_NEAREST 0x2700
+#define GL_LINEAR_MIPMAP_NEAREST 0x2701
+#define GL_NEAREST_MIPMAP_LINEAR 0x2702
+#define GL_TEXTURE_MIN_LOD 0x813A
+#define GL_TEXTURE_MAX_LOD 0x813B
+#define GL_TEXTURE_MAX_LEVEL 0x813D
+#define GL_TEXTURE_LOD_BIAS 0x8501
 #define GL_TEXTURE_MAG_FILTER 0x2800
 #define GL_TEXTURE_MIN_FILTER 0x2801
 #define GL_TEXTURE_WRAP_S 0x2802
@@ -58,6 +67,7 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
 #define GL_DEPTH_ATTACHMENT 0x8D00
 #define GL_DEPTH_COMPONENT24 0x81A6
 #define GL_DEPTH_COMPONENT 0x1902
+#define GL_UNSIGNED_INT 0x1405
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #define GL_READ_FRAMEBUFFER 0x8CA8
 #define GL_DRAW_FRAMEBUFFER 0x8CA9
@@ -78,7 +88,7 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
   X(void, glBlendEquation, (GLenum)) X(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*)) \
   X(void, glPixelStorei, (GLenum, GLint)) X(void, glGenTextures, (GLsizei, GLuint*)) X(void, glDeleteTextures, (GLsizei, const GLuint*)) \
   X(void, glBindTexture, (GLenum, GLuint)) X(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
-  X(void, glTexParameteri, (GLenum, GLenum, GLint)) X(void, glActiveTexture, (GLenum)) X(void, glDrawArrays, (GLenum, GLint, GLsizei)) \
+  X(void, glTexParameteri, (GLenum, GLenum, GLint)) X(void, glTexParameterf, (GLenum, GLenum, GLfloat)) X(void, glActiveTexture, (GLenum)) X(void, glDrawArrays, (GLenum, GLint, GLsizei)) \
   X(void, glGenBuffers, (GLsizei, GLuint*)) X(void, glBindBuffer, (GLenum, GLuint)) X(void, glBufferData, (GLenum, GLsizeiptr, const void*, GLenum)) \
   X(void, glGenVertexArrays, (GLsizei, GLuint*)) X(void, glBindVertexArray, (GLuint)) X(void, glEnableVertexAttribArray, (GLuint)) \
   X(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*)) X(GLuint, glCreateShader, (GLenum)) \
@@ -95,7 +105,7 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
   X(void, glRenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) X(void, glFramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
   X(void, glBlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
   X(const GLubyte*, glGetString, (GLenum)) X(void, glFinish, (void)) X(GLenum, glGetError, (void)) \
-  X(void, glLogicOp, (GLenum)) X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*))
+  X(void, glLogicOp, (GLenum)) X(void, glUniform3fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform2fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1ui, (GLint, GLuint)) X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*))
 
 #define GLDECL(ret, name, args) typedef ret (*PFN_##name) args; extern PFN_##name name;
 GLFUNCS(GLDECL)

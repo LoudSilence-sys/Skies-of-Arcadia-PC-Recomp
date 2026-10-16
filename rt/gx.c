@@ -50,6 +50,12 @@ void gx_bp(u32 v) {
     bp[r] = val;
     if (r == 0x52) efb_copy(val);
     if (r == 0x65) load_tlut();
+    if (r == 0x63 && val) {   /* TMEM preload (GXPreLoadEntireTexture), as Dolphin */
+        u32 src = (bp[0x60] & 0xFFFFFF) << 5, ev = (bp[0x61] & 0xFFFFFF) << 5, od = (bp[0x62] & 0xFFFFFF) << 5, cnt = val & 0x7FFF, type = (val >> 15) & 3;
+        if (type != 3) { for (u32 i = 0; i < cnt * 32 && ev + i < sizeof tmem; i++) tmem[ev + i] = g_ram[(src + i) & 0x01FFFFFF]; }
+        else for (u32 l = 0; l < cnt && ev + 32 <= sizeof tmem && od + 32 <= sizeof tmem; l++, ev += 32, od += 32) {
+            for (int i = 0; i < 32; i++) { tmem[ev + i] = g_ram[(src + l * 64 + i) & 0x01FFFFFF]; tmem[od + i] = g_ram[(src + l * 64 + 32 + i) & 0x01FFFFFF]; } }
+    }
 }
 
 /* ---------------- vertex decoding ---------------- */
@@ -231,10 +237,11 @@ static void transform(const InV* in, OutV* o) {
 }
 
 /* ---------------- textures ---------------- */
-typedef struct { u32 addr, w, h, fmt, wrap_s, wrap_t, tlut_fmt, tlut_off; } TexDesc;
+typedef struct { u32 addr, w, h, fmt, wrap_s, wrap_t, tlut_fmt, tlut_off; int tm; u32 even, odd; } TexDesc;
 static void load_tlut(void) {
     u32 src = (bp[0x64] & 0xFFFFFF) << 5; u32 v = bp[0x65];
     u32 tmem_off = (v & 0x3FF) << 9; u32 cnt = ((v >> 10) & 0x7FF) * 32;
+    { extern int g_dbgf, g_frame_no_pub; if (g_dbgf && g_frame_no_pub == g_dbgf) rt_log("loadtlut src %08X tmem %05X bytes %u first %02X%02X\n", src, tmem_off, cnt, R8(0x80000000u | src), R8(0x80000000u | (src + 1))); }
     for (u32 i = 0; i < cnt && tmem_off + i < sizeof tmem; i++) tmem[tmem_off + i] = R8(0x80000000u | ((src + i) & 0x01FFFFFF));
 }
 static void get_tex(int map, TexDesc* t) {
@@ -242,8 +249,9 @@ static void get_tex(int map, TexDesc* t) {
     u32 mode0 = bp[0x80 + b], img0 = bp[0x88 + b], img3 = bp[0x94 + b], tlut = bp[0x98 + b];
     t->w = (img0 & 0x3FF) + 1; t->h = ((img0 >> 10) & 0x3FF) + 1; t->fmt = (img0 >> 20) & 15;
     t->addr = (img3 & 0xFFFFFF) << 5; t->wrap_s = mode0 & 3; t->wrap_t = (mode0 >> 2) & 3;
-    t->tlut_off = ((tlut & 0x3FF) << 9) | 0x80000; t->tlut_fmt = (tlut >> 10) & 3;
-    if ((tlut & 0x3FF) << 9 >= 0x80000) t->tlut_off = (tlut & 0x3FF) << 9;
+    t->tlut_off = (tlut & 0x3FF) << 9; t->tlut_fmt = (tlut >> 10) & 3;   /* same addressing as BP 0x65 TLUT loads (as Dolphin) */
+    u32 img1 = bp[0x8C + b], img2 = bp[0x90 + b];
+    t->tm = (img1 >> 21) & 1; t->even = (img1 & 0x7FFF) << 5; t->odd = (img2 & 0x7FFF) << 5;   /* preloaded (manually managed) TMEM */
 }
 static u32 rgb5a3(u16 w) {
     u32 r, g, b, a;
@@ -258,6 +266,7 @@ static u32 tlut_color(const TexDesc* t, u32 idx) {
     if (t->tlut_fmt == 1) return rgb565(w);
     return rgb5a3(w);
 }
+static inline const u8* tptr(const TexDesc* t, u32 off) { return t->tm ? &tmem[(t->even + off) & 0xFFFFF] : g_ram + ((t->addr + off) & 0x01FFFFFF); }
 static u32 texel(const TexDesc* t, int x, int y) {
     /* block sizes per format */
     static const int bw[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 0}, bh[16] = {8, 4, 4, 4, 4, 4, 4, 0, 8, 4, 4, 0, 0, 0, 8, 0};
@@ -265,7 +274,7 @@ static u32 texel(const TexDesc* t, int x, int y) {
     if (f == 14) { /* CMPR: 8x8 blocks of 4 4x4 DXT1 sub-blocks */
         int bx = x / 8, by = y / 8, bpr = (t->w + 7) / 8;
         u32 off = base + (by * bpr + bx) * 32; int sx = (x % 8) / 4, sy = (y % 8) / 4; off += (sy * 2 + sx) * 8;
-        const u8* p = g_ram + (off & 0x01FFFFFF);
+        const u8* p = tptr(t, off - base);
         u16 c0 = p[0] << 8 | p[1], c1 = p[2] << 8 | p[3]; u32 cols[4]; cols[0] = rgb565(c0); cols[1] = rgb565(c1);
         u32 r0 = cols[0] & 255, g0 = (cols[0] >> 8) & 255, b0 = (cols[0] >> 16) & 255, r1 = cols[1] & 255, g1 = (cols[1] >> 8) & 255, b1 = (cols[1] >> 16) & 255;
         if (c0 > c1) { cols[2] = ((2 * r0 + r1) / 3) | ((2 * g0 + g1) / 3) << 8 | ((2 * b0 + b1) / 3) << 16 | 0xFF000000u; cols[3] = ((r0 + 2 * r1) / 3) | ((g0 + 2 * g1) / 3) << 8 | ((b0 + 2 * b1) / 3) << 16 | 0xFF000000u; }
@@ -278,16 +287,18 @@ static u32 texel(const TexDesc* t, int x, int y) {
     int bx = x / bw[f], by = y / bh[f], px = x % bw[f], py = y % bh[f];
     u32 blk = by * bpr + bx;
     switch (f) {
-    case 0: { const u8* p = g_ram + ((base + blk * 32 + (py * 8 + px) / 2) & 0x01FFFFFF); u32 i = (px & 1 ? *p & 15 : *p >> 4) * 17; return i | i << 8 | i << 16 | i << 24; }  /* I4 */
-    case 1: { u32 i = g_ram[(base + blk * 32 + py * 8 + px) & 0x01FFFFFF]; return i | i << 8 | i << 16 | i << 24; }                                                       /* I8 */
-    case 2: { u8 b = g_ram[(base + blk * 32 + py * 8 + px) & 0x01FFFFFF]; u32 a = (b >> 4) * 17, i = (b & 15) * 17; return i | i << 8 | i << 16 | a << 24; }               /* IA4 */
-    case 3: { const u8* p = g_ram + ((base + blk * 32 + (py * 4 + px) * 2) & 0x01FFFFFF); u32 a = p[0], i = p[1]; return i | i << 8 | i << 16 | a << 24; }               /* IA8 */
-    case 4: { const u8* p = g_ram + ((base + blk * 32 + (py * 4 + px) * 2) & 0x01FFFFFF); return rgb565(p[0] << 8 | p[1]); }
-    case 5: { const u8* p = g_ram + ((base + blk * 32 + (py * 4 + px) * 2) & 0x01FFFFFF); return rgb5a3(p[0] << 8 | p[1]); }
-    case 6: { const u8* p = g_ram + ((base + blk * 64 + (py * 4 + px) * 2) & 0x01FFFFFF); u32 a = p[0], r = p[1]; u32 g = p[32], b = p[33]; return r | g << 8 | b << 16 | a << 24; }  /* RGBA8 */
-    case 8: { const u8* p = g_ram + ((base + blk * 32 + (py * 8 + px) / 2) & 0x01FFFFFF); return tlut_color(t, px & 1 ? *p & 15 : *p >> 4); }   /* C4 */
-    case 9: return tlut_color(t, g_ram[(base + blk * 32 + py * 8 + px) & 0x01FFFFFF]);                                                           /* C8 */
-    case 10: { const u8* p = g_ram + ((base + blk * 32 + (py * 4 + px) * 2) & 0x01FFFFFF); return tlut_color(t, (p[0] << 8 | p[1]) & 0x3FFF); } /* C14X2 */
+    case 0: { const u8* p = tptr(t, (blk * 32 + (py * 8 + px) / 2)); u32 i = (px & 1 ? *p & 15 : *p >> 4) * 17; return i | i << 8 | i << 16 | i << 24; }  /* I4 */
+    case 1: { u32 i = *tptr(t, blk * 32 + py * 8 + px); return i | i << 8 | i << 16 | i << 24; }                                                       /* I8 */
+    case 2: { u8 b = *tptr(t, blk * 32 + py * 8 + px); u32 a = (b >> 4) * 17, i = (b & 15) * 17; return i | i << 8 | i << 16 | a << 24; }               /* IA4 */
+    case 3: { const u8* p = tptr(t, (blk * 32 + (py * 4 + px) * 2)); u32 a = p[0], i = p[1]; return i | i << 8 | i << 16 | a << 24; }               /* IA8 */
+    case 4: { const u8* p = tptr(t, (blk * 32 + (py * 4 + px) * 2)); return rgb565(p[0] << 8 | p[1]); }
+    case 5: { const u8* p = tptr(t, (blk * 32 + (py * 4 + px) * 2)); return rgb5a3(p[0] << 8 | p[1]); }
+    case 6: {   /* RGBA8: AR and GB halves; in preloaded TMEM they live in the even/odd banks */
+        if (t->tm) { const u8* pa = &tmem[(t->even + blk * 32 + (py * 4 + px) * 2) & 0xFFFFF]; const u8* pg = &tmem[(t->odd + blk * 32 + (py * 4 + px) * 2) & 0xFFFFF]; return pa[1] | pg[0] << 8 | pg[1] << 16 | (u32)pa[0] << 24; }
+        const u8* p = tptr(t, (blk * 64 + (py * 4 + px) * 2)); u32 a = p[0], r = p[1]; u32 g = p[32], b = p[33]; return r | g << 8 | b << 16 | a << 24; }
+    case 8: { const u8* p = tptr(t, (blk * 32 + (py * 8 + px) / 2)); return tlut_color(t, px & 1 ? *p & 15 : *p >> 4); }   /* C4 */
+    case 9: return tlut_color(t, *tptr(t, blk * 32 + py * 8 + px));                                                           /* C8 */
+    case 10: { const u8* p = tptr(t, (blk * 32 + (py * 4 + px) * 2)); return tlut_color(t, (p[0] << 8 | p[1]) & 0x3FFF); } /* C14X2 */
     }
     return 0xFFFF00FF;
 }
@@ -438,12 +449,37 @@ int gx_tex_info(int map, u32* key, u32* w, u32* h, u32* mode0, u32* nbytes, u32*
     int b = map < 4 ? map : map - 4 + 0x20;
     *w = d.w; *h = d.h; *mode0 = bp[0x80 + b]; *addr = d.addr; *nbytes = tex_bytes(d.fmt, d.w, d.h);
     key[0] = d.addr; key[1] = d.w | d.h << 16; key[2] = d.fmt | d.tlut_fmt << 4 | d.tlut_off << 8; key[3] = 0;
+    if (d.tm) {   /* preloaded: key and hash come from TMEM */
+        key[0] = 0xF0000000u | d.even; u32 n = *nbytes, hsh = 2166136261u;
+        for (u32 i = 0; i < n; i += 4) { hsh ^= tmem[(d.even + i) & 0xFFFFF]; hsh *= 16777619u; }
+        if (d.fmt == 6) for (u32 i = 0; i < n / 2; i += 4) { hsh ^= tmem[(d.odd + i) & 0xFFFFF]; hsh *= 16777619u; }
+        key[3] = hsh; *nbytes = 0;
+    }
     if (d.fmt == 8 || d.fmt == 9 || d.fmt == 10) {
         u32 n = d.fmt == 8 ? 32 : 512; u32 hsh = 2166136261u;
         for (u32 i = 0; i < n; i++) { hsh ^= tmem[(d.tlut_off + i) & 0xFFFFF]; hsh *= 16777619u; }
         key[3] = hsh;
     }
     return 1;
+}
+float gx_viewport_wd(void) { return xff(0x101A); }
+/* number of mip levels usable for a texture map (1 = no mipmapping) */
+int gx_tex_levels(int map) {
+    TexDesc d; get_tex(map, &d);
+    int b = map < 4 ? map : map - 4 + 0x20;
+    u32 m0 = bp[0x80 + b], m1 = bp[0x84 + b];
+    if (!((m0 >> 5) & 3) || d.tm) return 1;
+    int maxl = ((m1 >> 8) & 0xFF) + 15; maxl /= 16;
+    int n = 1; u32 w = d.w, h = d.h;
+    while (n <= maxl && (w > 1 || h > 1)) { w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; n++; }
+    return n > 11 ? 11 : n;
+}
+/* decode mip level lvl (levels follow each other in memory, each padded to whole blocks) */
+void gx_tex_decode_level(int map, int lvl, u32* out, u32* ow, u32* oh) {
+    TexDesc d; get_tex(map, &d);
+    for (int l = 0; l < lvl; l++) { d.addr += tex_bytes(d.fmt, d.w, d.h); d.w = d.w > 1 ? d.w / 2 : 1; d.h = d.h > 1 ? d.h / 2 : 1; }
+    *ow = d.w; *oh = d.h;
+    for (u32 y = 0; y < d.h; y++) for (u32 x = 0; x < d.w; x++) out[y * d.w + x] = texel(&d, x, y);
 }
 void gx_tex_decode(int map, u32* out) {
     TexDesc d; get_tex(map, &d);
@@ -453,6 +489,7 @@ void gx_dump_efb(const char* path, int w, int h);
 void gl_vertex(const float* pos4, const float* c0, const float* c1, const float tex[8][3]);
 void gl_flush(void);
 void gl_read_efb(u32* dst, int x, int y, int w, int h);
+void gl_read_efb_depth(u32* dst, int x, int y, int w, int h);
 void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alpha, int depth);
 
 /* ---------------- rasterization ---------------- */
@@ -574,6 +611,37 @@ static void clip_tri(const OutV* a, const OutV* b, const OutV* c) {
     for (int i = 1; i + 1 < m; i++) raster_tri(&s[0], &s[i], &s[i + 1]);
 }
 
+/* lines and points: expanded to screen-space quads (width from SU_LPSIZE, BP 0x22, in 1/6 pixel) */
+static void emit_sv(const SV* v, const OutV* o) {
+    float w = o->w; float zn = v->z / 16777215.f; if (zn < 0) zn = 0; if (zn > 1) zn = 1;
+    float pos[4] = {(v->x / 320.f - 1.f) * w, (1.f - v->y / 264.f) * w, (zn * 2.f - 1.f) * w, w};
+    gl_vertex(pos, o->col[0], o->col[1], o->tex);
+}
+static void quad_sv(SV q[4], const OutV* oa, const OutV* ob, const OutV* oc, const OutV* od) {
+    if (g_use_gl) { emit_sv(&q[0], oa); emit_sv(&q[1], ob); emit_sv(&q[2], oc); emit_sv(&q[0], oa); emit_sv(&q[2], oc); emit_sv(&q[3], od); }
+    else { raster_tri(&q[0], &q[1], &q[2]); raster_tri(&q[0], &q[2], &q[3]); }
+    g_tris += 2;
+}
+static void draw_line(const OutV* a, const OutV* b) {
+    if (a->w <= 0 || b->w <= 0) return;
+    SV sa, sb; to_screen(a, &sa); to_screen(b, &sb);
+    float hw = (bp[0x22] & 0xFF) / 6.0f * 0.5f; if (hw < 0.5f) hw = 0.5f;
+    float dx = sb.x - sa.x, dy = sb.y - sa.y;
+    /* GX widens lines along the minor axis */
+    float ox = 0, oy = 0; if (fabsf(dx) > fabsf(dy)) oy = hw; else ox = hw;
+    SV q[4] = {sa, sa, sb, sb};
+    q[0].x -= ox; q[0].y -= oy; q[1].x += ox; q[1].y += oy; q[2].x += ox; q[2].y += oy; q[3].x -= ox; q[3].y -= oy;
+    quad_sv(q, a, a, b, b);
+}
+static void draw_point(const OutV* a) {
+    if (a->w <= 0) return;
+    SV sa; to_screen(a, &sa);
+    float hs = ((bp[0x22] >> 8) & 0xFF) / 6.0f * 0.5f; if (hs < 0.5f) hs = 0.5f;
+    SV q[4] = {sa, sa, sa, sa};
+    q[0].x -= hs; q[0].y -= hs; q[1].x += hs; q[1].y -= hs; q[2].x += hs; q[2].y += hs; q[3].x -= hs; q[3].y += hs;
+    quad_sv(q, a, a, a, a);
+}
+
 void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     { static int n; extern int g_frame_no_pub; if (g_frame_no_pub > 600 && n < 6) { n++;
         rt_log("draw: vp %f %f %f %f %f %f proj %f %f %f %f %f %f type %u sc %06X %06X off %06X\n", xff(0x101A), xff(0x101B), xff(0x101C), xff(0x101D), xff(0x101E), xff(0x101F),
@@ -588,25 +656,46 @@ void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     case 2: for (int i = 0; i + 2 < count; i += 3) clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); break;
     case 3: for (int i = 0; i + 2 < count; i++) { if (i & 1) clip_tri(&vs[i + 1], &vs[i], &vs[i + 2]); else clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); } break;
     case 4: for (int i = 1; i + 1 < count; i++) clip_tri(&vs[0], &vs[i], &vs[i + 1]); break;
-    default: break;   /* lines/points: not yet */
+    case 5: for (int i = 0; i + 1 < count; i += 2) draw_line(&vs[i], &vs[i + 1]); break;
+    case 6: for (int i = 0; i + 1 < count; i++) draw_line(&vs[i], &vs[i + 1]); break;
+    case 7: for (int i = 0; i < count; i++) draw_point(&vs[i]); break;
+    default: break;
     }
     if (g_use_gl) gl_flush();
     { extern int g_dbgf; int dbgf = g_dbgf; extern int g_frame_no_pub;
-      if (dbgf && g_frame_no_pub == dbgf) {
+      static u32 dtex[4]; static int dtn = -1; if (dtn < 0) { dtn = 0; const char* e = getenv("SOA_DBGTEX"); if (e) dtn = sscanf(e, "%x,%x,%x,%x", &dtex[0], &dtex[1], &dtex[2], &dtex[3]); }
+      int texhit = 0; if (dtn > 0) { static int hits; TexDesc d0; get_tex(bp[0x28] & 7, &d0); for (int k = 0; k < dtn; k++) if (d0.addr == dtex[k] && hits < 40) { texhit = 1; hits++; } }
+      if ((dbgf && g_frame_no_pub == dbgf) || texhit) {
         static int nd; nd++;
         if (g_use_gl) gl_read_efb(efb_c, 0, 0, 640, 480);
         double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         int ns = ((bp[0] >> 10) & 15) + 1;
-        rt_log("D%d prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X tex0 fmt %u ras0 %08X %08X\n", nd, prim, count, vat,
-            m[0] / 4800, m[1] / 4800, m[2] / 4800, bp[0], ns, bp[0x41], bp[0x40], bp[0xF3], bp[0x43], bp[0xC0], bp[0xC1], bp[0x28], (bp[0x88] >> 20) & 15, xf_reg[0x0E], xf_reg[0x0C]);
-        if (nd % 50 == 0 || nd < 20) { char p[64]; snprintf(p, sizeof p, "frames/dbg_%04d.ppm", nd); gx_dump_efb(p, 640, 480); }
+        rt_log("D%d prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X %06X ras0 %08X %08X ind %06X fog %06X\n", nd, prim, count, vat,
+            m[0] / 4800, m[1] / 4800, m[2] / 4800, bp[0], ns, bp[0x41], bp[0x40], bp[0xF3], bp[0x43], bp[0xC0], bp[0xC1], bp[0x28], bp[0x29], xf_reg[0x0E], xf_reg[0x0C], bp[0x10], bp[0xF2]);
+        { float bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9, amin = 9, amax = -9; const u8* pp = data;
+          for (int i = 0; i < count && i < 64; i++) { InV iv; decode_vertex(pp, vat, &iv); pp += vsize; OutV ov; transform(&iv, &ov); SV sv; to_screen(&ov, &sv);
+            if (sv.x < bx0) bx0 = sv.x; if (sv.x > bx1) bx1 = sv.x; if (sv.y < by0) by0 = sv.y; if (sv.y > by1) by1 = sv.y; float a = ov.col[0][3]; if (a < amin) amin = a; if (a > amax) amax = a; }
+          { InV iv; decode_vertex(data, vat, &iv); OutV ov; transform(&iv, &ov); SV sv; to_screen(&ov, &sv); rt_log("   z0 %.1f w %.4f clipz %.4f vp %f %f proj %u %f %f\n", sv.z, ov.w, ov.z, xff(0x101C), xff(0x101F), xf_reg[0x26], xff(0x1024), xff(0x1025)); }
+          rt_log("   bbox %.0f,%.0f - %.0f,%.0f  alpha %.3f..%.3f  vsize %d\n", bx0, by0, bx1, by1, amin, amax, vsize); }
+        { InV iv; decode_vertex(data, vat, &iv); OutV ov; transform(&iv, &ov); float sc[4] = {0, 0, 0, 0}; float q = ov.tex[0][2] ? ov.tex[0][2] : 1; sample(0, ov.tex[0][0] / q, ov.tex[0][1] / q, sc);
+          rt_log("   v0: in tex %.4f %.4f tmi %d -> %.4f %.4f %.4f  sample %.2f %.2f %.2f %.2f texgen %08X vcd hi %08X\n", iv.tex[0][0], iv.tex[0][1], iv.tmi[0], ov.tex[0][0], ov.tex[0][1], ov.tex[0][2], sc[0], sc[1], sc[2], sc[3], xf_reg[0x40], g_cp_regs[0x60]); }
+        { InV iv; decode_vertex(data, vat, &iv); rt_log("   xf: ctl c0 %08X a0 %08X c1 %08X a1 %08X mat %08X %08X amb %08X %08X nchan %u | vcd %08X vatA %08X | v0 col %.3f %.3f %.3f %.3f\n", xf_reg[0x0E], xf_reg[0x10], xf_reg[0x0F], xf_reg[0x11], xf_reg[0x0C], xf_reg[0x0D], xf_reg[0x0A], xf_reg[0x0B], xf_reg[0x09], g_cp_regs[0x50], g_cp_regs[0x70 + vat], iv.col[0][0], iv.col[0][1], iv.col[0][2], iv.col[0][3]); }
+        for (int s2 = 0; s2 < ns; s2++) { u32 o = bp[0x28 + s2 / 2]; if (s2 & 1) o >>= 12; if (!((o >> 6) & 1)) continue; int mp = o & 7; TexDesc d; get_tex(mp, &d);
+            int bb = mp < 4 ? mp : mp - 4 + 0x20; double ta[4] = {0, 0, 0, 0}; int nn = 0;
+            for (u32 yy = 0; yy < d.h; yy += (d.h + 7) / 8) for (u32 xx = 0; xx < d.w; xx += (d.w + 7) / 8) { u32 c = texel(&d, xx, yy); for (int k = 0; k < 4; k++) ta[k] += (c >> (8 * k)) & 255; nn++; }
+            { char tp[96]; snprintf(tp, sizeof tp, "frames/tex_%08X_f%u_%ux%u.ppm", d.addr, d.fmt, d.w, d.h); FILE* tf = fopen(tp, "rb"); if (!tf && d.w * d.h <= 1024 * 1024) { tf = fopen(tp, "wb"); if (tf) { fprintf(tf, "P6\n%u %u\n255\n", d.w * 2, d.h);
+                for (u32 yy = 0; yy < d.h; yy++) { for (u32 xx = 0; xx < d.w; xx++) { u32 c = texel(&d, xx, yy); fputc(c & 255, tf); fputc((c >> 8) & 255, tf); fputc((c >> 16) & 255, tf); } for (u32 xx = 0; xx < d.w; xx++) { u32 c = texel(&d, xx, yy) >> 24; fputc(c, tf); fputc(c, tf); fputc(c, tf); } } } } if (tf) fclose(tf); }
+            rt_log("   st%d map %d fmt %u %ux%u addr %08X mode0 %06X mode1 %06X img1 %06X img2 %06X tlut %06X mean %3.0f %3.0f %3.0f a%3.0f ce %06X ae %06X\n", s2, mp, d.fmt, d.w, d.h, d.addr, bp[0x80 + bb], bp[0x84 + bb], bp[0x8C + bb], bp[0x90 + bb], bp[0x98 + bb],
+                   ta[0] / nn, ta[1] / nn, ta[2] / nn, ta[3] / nn, bp[0xC0 + 2 * s2], bp[0xC1 + 2 * s2]); }
+        static int r0 = -1, r1; if (r0 < 0) { const char* e = getenv("SOA_DBGRANGE"); r0 = 0; r1 = -1; if (e) sscanf(e, "%d,%d", &r0, &r1); }
+        if (nd % 10 == 0 || nd < 40 || (nd >= r0 && nd <= r1)) { char p[64]; snprintf(p, sizeof p, "frames/dbg_%04d.ppm", nd); gx_dump_efb(p, 640, 480); }
       } }
 }
 
 /* ---------------- EFB copies ---------------- */
 int g_xfb_ready; u32 g_xfb_addr;
 static void efb_copy(u32 v) {
-    { extern int g_frame_no_pub; static int n; if (!((v >> 14) & 1) && g_frame_no_pub > 1300 && g_frame_no_pub < 1320 && n++ < 60) rt_log("texcopy %06X fmt %d src %06X wh %06X dst %08X stride %X pixfmt %X\n", v, ((v >> 4) & 7) | (((v >> 3) & 1) << 3), bp[0x49], bp[0x4A], (bp[0x4B] & 0xFFFFFF) << 5, bp[0x4D], bp[0x43]); }
+    { extern int g_frame_no_pub; extern int g_dbgf; static int n; if ((g_dbgf && g_frame_no_pub == g_dbgf) || (!((v >> 14) & 1) && g_frame_no_pub > 1300 && g_frame_no_pub < 1320 && n++ < 60)) rt_log("texcopy %06X fmt %d src %06X wh %06X dst %08X stride %X pixfmt %X\n", v, ((v >> 4) & 7) | (((v >> 3) & 1) << 3), bp[0x49], bp[0x4A], (bp[0x4B] & 0xFFFFFF) << 5, bp[0x4D], bp[0x43]); }
     u32 tl = bp[0x49], wh = bp[0x4A];
     int sx = tl & 0x3FF, sy = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
     u32 dst = (bp[0x4B] & 0xFFFFFF) << 5; u32 stride = (bp[0x4D] & 0x3FF) << 5;
@@ -631,6 +720,15 @@ static void efb_copy(u32 v) {
         /* texture copy (formats per Dolphin's EFBCopyFormat; layout = GX texture block layout) */
         int tpf = (v >> 3) & 15; int fmt = tpf / 2 + (tpf & 1) * 8; int inten = (v >> 15) & 1;
         int noalpha = (bp[0x43] & 7) != 1;
+        int depth = (bp[0x43] & 7) == 3;   /* Z24 pixel format: copy the depth buffer (hi, mid, low bytes as r, g, b) */
+        u32* src = efb_c;
+        if (depth) {
+            static u32 zb[EFB_W * EFB_H];
+            if (g_use_gl) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb_depth(zb, sx, sy, rw, rh); }
+            else memcpy(zb, efb_z, sizeof zb);
+            for (int y = 0; y < h && sy + y < EFB_H; y++) for (int x = 0; x < w && sx + x < EFB_W; x++) { u32 z = zb[(sy + y) * EFB_W + sx + x]; zb[(sy + y) * EFB_W + sx + x] = (z >> 16 & 255) | (z >> 8 & 255) << 8 | (z & 255) << 16 | 0xFF000000u; }
+            src = zb; inten = 0;
+        }
         int scale = half ? 2 : 1; int tw = w / scale, th = h / scale;
         /* bits per texel and block size */
         int bpp = (fmt == 0) ? 4 : (fmt == 2 || fmt == 7 || fmt == 8 || fmt == 1 || fmt == 9 || fmt == 10) ? 8 : (fmt == 6) ? 32 : 16;
@@ -641,9 +739,9 @@ static void efb_copy(u32 v) {
             u32 c;
             if (scale == 2) {  /* 2x2 box filter */
                 u32 acc[4] = {0, 0, 0, 0};
-                for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { u32 q = efb_c[(sy + y * 2 + dy) * EFB_W + sx + x * 2 + dx]; for (int k = 0; k < 4; k++) acc[k] += (q >> (8 * k)) & 255; }
+                for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { u32 q = src[(sy + y * 2 + dy) * EFB_W + sx + x * 2 + dx]; for (int k = 0; k < 4; k++) acc[k] += (q >> (8 * k)) & 255; }
                 c = (acc[0] / 4) | (acc[1] / 4) << 8 | (acc[2] / 4) << 16 | (acc[3] / 4) << 24;
-            } else c = efb_c[(sy + y) * EFB_W + sx + x];
+            } else c = src[(sy + y) * EFB_W + sx + x];
             u32 r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = noalpha ? 255 : c >> 24;
             if (inten) { u32 Y = (u32)(0.257f * r + 0.504f * g + 0.098f * b + 16); if (Y > 255) Y = 255; r = g = b = Y; }
             int bx = x / bw, by = y / bh, px = x % bw, py = y % bh; u32 blk = by * bpr + bx;
@@ -682,10 +780,11 @@ void gx_dump_efb(const char* path, int w, int h) {
 }
 static int g_frame_no; int g_frame_no_pub; int g_dbgf;
 int g_dump_every = 25;
+static void dbg_init(void) { static int d; if (!d) { d = 1; const char* e = getenv("SOA_DBGFRAME"); if (e) g_dbgf = atoi(e); } }
 WEAK void platform_present(void) { }
 void gx_frame_done(int w, int h) {
     if (g_use_gl) platform_present();
-    g_frame_no++; g_frame_no_pub = g_frame_no;
+    dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
     { static int armed = 1; if (armed && getenv("SOA_REDDBG")) { double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         if (m[0] > 2 * m[1] + 4800 * 10 && m[0] > 60 * 4800) { armed = 0; g_dbgf = g_frame_no + 1; rt_log("red frame %d detected, tracing next\n", g_frame_no); gx_dump_efb("frames/red_before.ppm", 640, 480); } } }
     { static int bt = -1; if (bt < 0) { const char* e = getenv("SOA_BT_FRAME"); bt = e ? atoi(e) : 0; }
