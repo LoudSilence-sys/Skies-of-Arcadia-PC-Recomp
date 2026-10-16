@@ -105,6 +105,7 @@ void rt_poll(Ctx* c) {
         g_frames++;
         { extern void platform_pump(void); platform_pump(); }
         vi_retrace_event();
+        { extern void interp_vi(void); interp_vi(); }
         { extern int vi_refresh_hz(void); static int hz = 50; int nh = vi_refresh_hz(); if (nh != hz) { hz = nh; g_vi_period = TB_RATE / hz; rt_log("VI: %d Hz\n", hz); } }
     }
     hw_tick();

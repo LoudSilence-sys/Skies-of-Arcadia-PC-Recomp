@@ -262,14 +262,20 @@ static const char* CFS =
 "  o=r; }\n";
 void gl_flush(void);
 static GLuint g_cprog, g_cvao; static GLint uc_src, uc_rect, uc_dsize, uc_fmt, uc_flags;
-typedef struct { u32 addr, tw, th, tfmt, nbytes, rhash; GLuint tex, fbo; int gw, gh; u64 frame; } CopyEnt;
+/* Each address keeps up to three versions of its copy: the current one, the one that was current when the
+   frame started (frame interpolation replays a frame from its start, so it must see that one), and a shadow
+   that the replay itself renders into. */
+typedef struct { u32 tw, th, tfmt, nbytes, rhash; GLuint tex, fbo; int gw, gh; } CopyVer;
+typedef struct { u32 addr; CopyVer v[3]; int cur, start, shadow; u64 frame; int used; } CopyEnt;
 #define NCOPY 128
 static CopyEnt g_copies[NCOPY];
 int g_gpu_copies = 1;
+int gx_replaying(void);
 static u32 sampled_hash(u32 a, u32 n) { u32 h = 2166136261u; for (u32 i = 0; i + 4 <= n; i += 256) { h ^= *(const u32*)(g_ram + ((a + i) & 0x01FFFFFC)); h *= 16777619u; } return h ^ n; }
 static GLuint compile(GLenum t, const char* src);
 /* copy fmt (GX EFB copy format) -> texture format the game will sample it as */
 static int copy_tex_fmt(int f) { static const int m[13] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3}; return f >= 0 && f < 13 ? m[f] : -1; }
+void gl_copies_frame_start(void) { for (int i = 0; i < NCOPY; i++) { g_copies[i].start = g_copies[i].cur; g_copies[i].shadow = -1; } }
 int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes) {
     if (!g_gpu_copies || copy_tex_fmt(fmt) < 0) return 0;
     gl_flush();
@@ -284,23 +290,34 @@ int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, 
     int tw = half ? w / 2 : w, th = half ? h / 2 : h; if (tw < 1 || th < 1) return 1;
     int gw = tw * g_scale, gh = th * g_scale;
     u32 a = dst & 0x01FFFFFF;
+    int replay = gx_replaying();
     CopyEnt* e = 0; CopyEnt* old = &g_copies[0];
     for (int i = 0; i < NCOPY; i++) {
         CopyEnt* c = &g_copies[i];
-        if (c->tex && c->addr == a) { e = c; break; }
-        if (old->tex && (!c->tex || c->frame < old->frame)) old = c;   /* prefer an unused slot, else the least recently used */
+        if (c->used && c->addr == a) { e = c; break; }
+        if (old->used && (!c->used || c->frame < old->frame)) old = c;   /* prefer an unused slot, else the least recently used */
     }
-    if (!e) { e = old; if (!e->tex) { glGenTextures(1, &e->tex); glGenFramebuffers(1, &e->fbo); } e->gw = e->gh = 0; }
-    glBindTexture(GL_TEXTURE_2D, e->tex);
-    if (e->gw != gw || e->gh != gh) {
+    if (!e) { if (replay) return 1; e = old; e->used = 1; e->addr = a; e->cur = 0; e->start = -1; e->shadow = -1; }
+    int slot;
+    if (replay) {   /* the replay renders into its own version */
+        if (e->shadow < 0) { for (slot = 0; slot < 3 && (slot == e->start || slot == e->cur); slot++) ; e->shadow = slot < 3 ? slot : e->cur; }
+        slot = e->shadow;
+    } else {
+        if (e->cur == e->start) { for (slot = 0; slot < 3 && slot == e->start; slot++) ; e->cur = slot; }   /* keep the frame-start version intact */
+        slot = e->cur;
+    }
+    CopyVer* v = &e->v[slot];
+    if (!v->tex) { glGenTextures(1, &v->tex); glGenFramebuffers(1, &v->fbo); v->gw = v->gh = 0; }
+    glBindTexture(GL_TEXTURE_2D, v->tex);
+    if (v->gw != gw || v->gh != gh) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, gw, gh, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, e->fbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->tex, 0);
-        e->gw = gw; e->gh = gh;
+        glBindFramebuffer(GL_FRAMEBUFFER, v->fbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, v->tex, 0);
+        v->gw = gw; v->gh = gh;
     }
-    e->addr = a; e->tw = tw; e->th = th; e->tfmt = copy_tex_fmt(fmt); e->nbytes = nbytes; e->frame = g_gl_frame;
-    e->rhash = sampled_hash(a, nbytes);
-    glBindFramebuffer(GL_FRAMEBUFFER, e->fbo); glViewport(0, 0, gw, gh);
+    v->tw = tw; v->th = th; v->tfmt = copy_tex_fmt(fmt); v->nbytes = nbytes; e->frame = g_gl_frame;
+    v->rhash = sampled_hash(a, nbytes);
+    glBindFramebuffer(GL_FRAMEBUFFER, v->fbo); glViewport(0, 0, gw, gh);
     glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_COLOR_LOGIC_OP); glColorMask(1, 1, 1, 1);
     glUseProgram(g_cprog); glBindVertexArray(g_cvao);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_fbtex);
@@ -318,10 +335,13 @@ static GLuint copy_lookup(u32 addr, u32 w, u32 h, u32 fmt) {
     u32 a = addr & 0x01FFFFFF;
     for (int i = 0; i < NCOPY; i++) {
         CopyEnt* c = &g_copies[i];
-        if (!c->tex || c->addr != a) continue;
-        if (c->tw != w || c->th != h || c->tfmt != fmt) return 0;
-        if (sampled_hash(a, c->nbytes) != c->rhash) { c->addr = 0xFFFFFFFF; return 0; }   /* overwritten by other data */
-        c->frame = g_gl_frame; return c->tex;
+        if (!c->used || c->addr != a) continue;
+        int slot = c->cur;
+        if (gx_replaying()) slot = c->shadow >= 0 ? c->shadow : c->start >= 0 ? c->start : c->cur;
+        CopyVer* v = &c->v[slot];
+        if (!v->tex || v->tw != w || v->th != h || v->tfmt != fmt) return 0;
+        if (sampled_hash(a, v->nbytes) != v->rhash) { if (!gx_replaying()) c->used = 0; return 0; }   /* overwritten by other data */
+        c->frame = g_gl_frame; return v->tex;
     }
     return 0;
 }
@@ -531,6 +551,21 @@ void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alph
     glColorMask(1, 1, 1, 1);
 }
 
+/* frame interpolation: the real frame is kept in a texture while the in-between frame is shown */
+static GLuint g_sfbo, g_stex; static int g_show_saved;
+void gl_save_real(void) {
+    gl_flush();
+    if (!g_sfbo) {
+        glGenFramebuffers(1, &g_sfbo); glGenTextures(1, &g_stex); glBindTexture(GL_TEXTURE_2D, g_stex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_sfbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_stex, 0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_sfbo);
+    glBlitFramebuffer(0, 0, SW, SH, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+}
+void gl_show_saved(int on) { g_show_saved = on; }
 void gl_blit_to_screen(int w, int h) {
     gl_flush();
     glDisable(GL_SCISSOR_TEST);
@@ -538,7 +573,7 @@ void gl_blit_to_screen(int w, int h) {
     glViewport(0, 0, w, h); glClearColor(0, 0, 0, 1); glColorMask(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
     int dw = w, dh = w * 3 / 4; if (dh > h) { dh = h; dw = h * 4 / 3; }
     int dx = (w - dw) / 2, dy = (h - dh) / 2;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
     glBlitFramebuffer(0, (EFB_H - 480) * g_scale, 640 * g_scale, EFB_H * g_scale, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
 }

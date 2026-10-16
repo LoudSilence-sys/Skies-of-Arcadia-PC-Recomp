@@ -21,6 +21,7 @@ static u32 xf_mem[0x1000];         /* 0x0000-0x0FFF: matrices, normals, post, li
 static u32 xf_reg[0x100];          /* 0x1000-0x10FF */
 static u8 tmem[1 << 20];
 u64 host_tb(void);
+void platform_present(void);
 u32 g_tex_epoch = 1;   /* see bind_tex: advances whenever texture memory may have changed */
 u64 g_tris; int g_exp = -1; u32 g_rej[3];   /* SOA_EXP debug knobs: 1 no culling, 2 no depth test */
 
@@ -28,24 +29,35 @@ static float xff(u32 a) { u32 v = a < 0x1000 ? xf_mem[a] : xf_reg[a & 0xFF]; flo
 
 /* ---------------- state hooks ---------------- */
 void gx_cp(u8 reg, u32 v) { (void)reg; (void)v; }
+/* frame interpolation recorder (see the "frame interpolation" section below) */
+static int g_rec;          /* recording the current frame's GX command log */
+static int g_replay;       /* replaying a log (suppresses side effects visible to the game) */
+static void rec_xf(u32 addr, u32 n, const u32* v);
+static void rec_bp(u32 v);
+static void xf_store(u32 a, u32 v) { if (a < 0x1000) xf_mem[a] = v; else if (a < 0x1100) xf_reg[a & 0xFF] = v; }
 void gx_xf(u32 addr, int n, const u8* d) {
+    u32 vals[16];
     for (int i = 0; i < n; i++) {
         u32 v = (u32)d[4 * i] << 24 | (u32)d[4 * i + 1] << 16 | (u32)d[4 * i + 2] << 8 | d[4 * i + 3];
-        u32 a = addr + i;
-        if (a < 0x1000) xf_mem[a] = v; else if (a < 0x1100) xf_reg[a & 0xFF] = v;
+        if (i < 16) vals[i] = v;
+        xf_store(addr + i, v);
     }
+    if (g_rec && n <= 16) rec_xf(addr, (u32)n, vals);
 }
 void gx_xf_indexed(int which, u32 v) {
     /* which: 0 pos (A), 1 nrm (B), 2 tex (C), 3 light (D) */
     u32 idx = v >> 16, xfaddr = v & 0xFFF, n = ((v >> 12) & 0xF) + 1;
     u32 base = g_cp_regs[0xAC + which], stride = g_cp_regs[0xB0 + 0xC + which];
     u32 src = (base + idx * stride) & 0x01FFFFFF;
-    for (u32 i = 0; i < n; i++) { u32 w = R32(0x80000000u | (src + 4 * i)); if (xfaddr + i < 0x1000) xf_mem[xfaddr + i] = w; }
+    u32 vals[16];
+    for (u32 i = 0; i < n; i++) { u32 w = R32(0x80000000u | (src + 4 * i)); vals[i] = w; if (xfaddr + i < 0x1000) xf_mem[xfaddr + i] = w; }
+    if (g_rec) rec_xf(xfaddr, n, vals);
 }
 
 static void efb_copy(u32 v);
 static void load_tlut(void);
 void gx_bp(u32 v) {
+    if (g_rec) rec_bp(v);
     u8 r = v >> 24; u32 val = v & 0xFFFFFF;
     if (r == 0xFE) { bp[0xFE] = val; return; }                        /* BP mask for next write */
     if (bp[0xFE]) { u32 m = bp[0xFE]; val = (bp[r] & ~m) | (val & m); bp[0xFE] = 0; }
@@ -657,15 +669,24 @@ static void draw_point(const OutV* a) {
     quad_sv(q, a, a, a, a);
 }
 
+static void rec_draw(int prim, int vat, int count, const InV* ins);
+static void draw_core(int prim, int vat, int count, const InV* ins, const u8* data, int vsize);
 void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
+    static InV ins[65536];
+    if (count > 65536) count = 65536;
+    const u8* p = data;
+    for (int i = 0; i < count; i++) { decode_vertex(p, vat, &ins[i]); p += vsize; }
+    if (g_rec) rec_draw(prim, vat, count, ins);
+    draw_core(prim, vat, count, ins, data, vsize);
+}
+static void draw_core(int prim, int vat, int count, const InV* ins, const u8* data, int vsize) {
     { static int n; extern int g_frame_no_pub; if (g_frame_no_pub > 600 && n < 6) { n++;
         rt_log("draw: vp %f %f %f %f %f %f proj %f %f %f %f %f %f type %u sc %06X %06X off %06X\n", xff(0x101A), xff(0x101B), xff(0x101C), xff(0x101D), xff(0x101E), xff(0x101F),
             xff(0x1020), xff(0x1021), xff(0x1022), xff(0x1023), xff(0x1024), xff(0x1025), xf_reg[0x26], bp[0x20], bp[0x21], bp[0x59]); } }
     static OutV vs[65536];
     if (count > 65536) count = 65536;
     if (!g_tev.init || 1) { tev_regs(g_tev.reg, g_tev.konst); g_tev.init = 1; }
-    const u8* p = data;
-    for (int i = 0; i < count; i++) { InV in; const u8* q = decode_vertex(p, vat, &in); (void)q; p += vsize; transform(&in, &vs[i]); }
+    for (int i = 0; i < count; i++) transform(&ins[i], &vs[i]);
     if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
     u64 tris0 = g_tris; g_rej[0] = g_rej[1] = g_rej[2] = 0;
     switch (prim) {
@@ -679,6 +700,7 @@ void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     default: break;
     }
     if (g_use_gl) gl_flush();
+    if (g_replay || !data) return;
     { extern int g_dbgf; int dbgf = g_dbgf; extern int g_frame_no_pub;
       static u32 dtex[4]; static int dtn = -1; if (dtn < 0) { dtn = 0; const char* e = getenv("SOA_DBGTEX"); if (e) dtn = sscanf(e, "%x,%x,%x,%x", &dtex[0], &dtex[1], &dtex[2], &dtex[3]); }
       int texhit = 0; if (dtn > 0) { static int hits; TexDesc d0; get_tex(bp[0x28] & 7, &d0); for (int k = 0; k < dtn; k++) if (d0.addr == dtex[k] && hits < 40) { texhit = 1; hits++; } }
@@ -719,9 +741,27 @@ static void efb_copy(u32 v) {
     int sx = tl & 0x3FF, sy = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
     u32 dst = (bp[0x4B] & 0xFFFFFF) << 5; u32 stride = (bp[0x4D] & 0x3FF) << 5;
     int to_xfb = (v >> 14) & 1, clear = (v >> 11) & 1, half = (v >> 9) & 1;
+    if (g_replay) {   /* interpolated frame: nothing may reach game-visible memory */
+        extern void interp_replay_xfb(void);
+        if (to_xfb) interp_replay_xfb();
+        else if ((bp[0x43] & 7) != 3) {
+            extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes);
+            int tpf = (v >> 3) & 15, fmt = tpf / 2 + (tpf & 1) * 8;
+            int tw = half ? w / 2 : w, th = half ? h / 2 : h; int bpp = (fmt == 0) ? 4 : (fmt == 2 || fmt == 7 || fmt == 8 || fmt == 1 || fmt == 9 || fmt == 10) ? 8 : (fmt == 6) ? 32 : 16;
+            int bw = bpp == 4 ? 8 : bpp == 8 ? 8 : 4, bh = bpp == 4 ? 8 : 4; u32 nb = (u32)((tw + bw - 1) / bw) * ((th + bh - 1) / bh) * (bpp == 32 ? 64 : 32);
+            gl_efb_copy_tex(sx, sy, w, h, half, fmt, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb);
+        }
+        if (clear) {
+            u32 ar = bp[0x4F], gb = bp[0x50], cz = bp[0x51] & 0xFFFFFF;
+            u32 cc = (ar & 255) | ((gb >> 8) & 255) << 8 | (gb & 255) << 16 | ((ar >> 8) & 255) << 24;
+            u32 bm = bp[0x41], zm = bp[0x40]; gl_clear(sx, sy, w, h, cc, cz, (bm >> 3) & 1, (bm >> 4) & 1, (zm >> 4) & 1);
+        }
+        return;
+    }
     extern int g_dump_every; extern int g_dbgf;
     extern int g_frame_no_pub;
-    int need_xfb_pixels = (g_dump_every && (g_frame_no_pub + 1) % g_dump_every == 0) || g_dbgf || !g_use_gl;   /* GL presents the EFB directly; the XFB in RAM is only for dumps */
+    extern int dump_this(int frame);
+    int need_xfb_pixels = dump_this(g_frame_no_pub + 1) || g_dbgf || !g_use_gl;   /* GL presents the EFB directly; the XFB in RAM is only for dumps */
     int tpf0 = (v >> 3) & 15, fmt0 = tpf0 / 2 + (tpf0 & 1) * 8;
     int gpu_copy = 0;
     if (g_use_gl && !to_xfb && (bp[0x43] & 7) != 3 && !g_dbgf) {   /* texture copy kept on the GPU (not depth) */
@@ -820,9 +860,162 @@ int g_dump_every = 25;
 #endif
 static void dbg_init(void) { static int d; if (!d) { d = 1; const char* e = getenv("SOA_DBGFRAME"); if (e) g_dbgf = atoi(e); e = getenv("SOA_DUMP"); if (e) g_dump_every = atoi(e); } }
 WEAK void platform_present(void) { }
+/* frame dumps: every g_dump_every-th frame, plus every frame in SOA_DUMPRANGE=a,b */
+int dump_this(int frame) {
+    static int r0 = -1, r1; if (r0 < 0) { r0 = 0; r1 = -1; const char* e = getenv("SOA_DUMPRANGE"); if (e) sscanf(e, "%d,%d", &r0, &r1); }
+    return (g_dump_every && frame % g_dump_every == 0) || (frame >= r0 && frame <= r1);
+}
+/* ---------------- frame interpolation (settings.ini fps60) ----------------
+   The game steps its logic once per frame at 30 Hz (two fields per frame). For 60 fps, every frame's GX command
+   log is recorded (BP and XF writes, and draws with their vertices already decoded from RAM). When frame N
+   completes, its log is replayed with the transform matrices (position/normal matrices, projection) blended
+   halfway towards frame N-1's matching writes, and that in-between image is shown first; the real frame N is
+   shown one field later. XF writes are matched between frames by address, size and order of occurrence; a
+   write whose values jump too far (a camera cut, a different object) is not blended. Replays never touch
+   anything the game can see (RAM, interrupts). */
+typedef struct { u8* b; size_t n, cap; } Arena;
+typedef struct { u32 bp[256]; u32 xf_mem[0x1000]; u32 xf_reg[0x100]; u32 tevcol[2][8]; } GxState;
+enum { EV_BP = 1, EV_XF = 2, EV_DRAW = 3 };
+static Arena g_log[2]; static GxState g_start[2]; static int g_cur, g_prev_ok, g_pending_real;
+int g_interp = -1;
+int gx_replaying(void) { return g_replay; }
+typedef struct { u32 key, seq, off; } XKey;
+static XKey* g_pidx; static int g_pn, g_pcap;
+static void* ar_alloc(Arena* a, size_t n) { if (a->n + n > a->cap) { a->cap = (a->n + n) * 2 + (1u << 20); a->b = realloc(a->b, a->cap); } void* p = a->b + a->n; a->n += n; return p; }
+static void rec_bp(u32 v) { u32* p = ar_alloc(&g_log[g_cur], 8); p[0] = EV_BP; p[1] = v; }
+static void rec_xf(u32 addr, u32 n, const u32* v) { u32* p = ar_alloc(&g_log[g_cur], 12 + 4 * n); p[0] = EV_XF; p[1] = addr; p[2] = n; memcpy(p + 3, v, 4 * n); }
+static void rec_draw(int prim, int vat, int count, const InV* ins) {
+    /* p[0] = type | signature: the draw's texture and combiner state, so draws match the same object next frame */
+    u32 sig = 2166136261u; const u32 regs[] = {bp[0x94], bp[0x88], bp[0xC0], bp[0xC1], bp[0x28], bp[0x00], bp[0x41]};
+    for (int i = 0; i < 7; i++) { sig ^= regs[i]; sig *= 16777619u; }
+    u32* p = ar_alloc(&g_log[g_cur], 16 + sizeof(InV) * (size_t)count); p[0] = EV_DRAW | (sig & 0xFFFFFF00u); p[1] = (u32)prim; p[2] = (u32)vat; p[3] = (u32)count; memcpy(p + 4, ins, sizeof(InV) * (size_t)count);
+}
+static void st_save(GxState* st) { memcpy(st->bp, bp, sizeof bp); memcpy(st->xf_mem, xf_mem, sizeof xf_mem); memcpy(st->xf_reg, xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(st->tevcol, g_tevcol, sizeof st->tevcol); }
+static void st_load(const GxState* st) { memcpy(bp, st->bp, sizeof bp); memcpy(xf_mem, st->xf_mem, sizeof xf_mem); memcpy(xf_reg, st->xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(g_tevcol, st->tevcol, sizeof st->tevcol); }
+/* per-key occurrence counters (open addressing) */
+#define KH 8192
+static u32 g_kh_key[KH], g_kh_cnt[KH], g_kh_gen[KH], g_kgen = 1;
+static u32 key_next(u32 key) { u32 h = (key * 2654435761u) & (KH - 1); while (g_kh_gen[h] == g_kgen && g_kh_key[h] != key) h = (h + 1) & (KH - 1); if (g_kh_gen[h] != g_kgen) { g_kh_gen[h] = g_kgen; g_kh_key[h] = key; g_kh_cnt[h] = 0; } return g_kh_cnt[h]++; }
+static int xk_cmp(const void* a, const void* b) { const XKey* x = a; const XKey* y = b; return x->key != y->key ? (x->key < y->key ? -1 : 1) : (x->seq < y->seq ? -1 : x->seq > y->seq); }
+/* draws are matched by primitive, vertex format, vertex count and matrix index (bit 31 marks a draw key) */
+static u32 draw_key(const u32* e) { const InV* v = (const InV*)(e + 4); u32 k = (e[0] & 0xFFFFFF00u) ^ (e[3] * 2654435761u) ^ (e[1] << 5 | e[2] << 2) ^ ((u32)(e[3] ? v[0].pmi : 0) << 13); return k | 0x80000000u; }
+static void index_log(const Arena* a) {
+    g_pn = 0; g_kgen++;
+    for (size_t o = 0; o < a->n;) {
+        const u32* e = (const u32*)(a->b + o);
+        if ((e[0] & 0xFF) == EV_XF) { if (g_pn == g_pcap) { g_pcap = g_pcap ? g_pcap * 2 : 4096; g_pidx = realloc(g_pidx, sizeof(XKey) * g_pcap); } u32 key = e[1] << 5 | e[2]; g_pidx[g_pn].key = key; g_pidx[g_pn].seq = key_next(key); g_pidx[g_pn].off = (u32)o; g_pn++; o += 12 + 4 * e[2]; }
+        else if ((e[0] & 0xFF) == EV_BP) o += 8;
+        else { if (g_pn == g_pcap) { g_pcap = g_pcap ? g_pcap * 2 : 4096; g_pidx = realloc(g_pidx, sizeof(XKey) * g_pcap); } u32 key = draw_key(e); g_pidx[g_pn].key = key; g_pidx[g_pn].seq = key_next(key); g_pidx[g_pn].off = (u32)o; g_pn++; o += 16 + sizeof(InV) * e[3]; }
+    }
+    qsort(g_pidx, g_pn, sizeof(XKey), xk_cmp);
+}
+static const u32* prev_match(u32 key, u32 seq) {
+    int lo = 0, hi = g_pn;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_pidx[m].key < key || (g_pidx[m].key == key && g_pidx[m].seq < seq)) lo = m + 1; else hi = m; }
+    if (lo < g_pn && g_pidx[lo].key == key && g_pidx[lo].seq == seq) return (const u32*)(g_log[g_cur ^ 1].b + g_pidx[lo].off);
+    return 0;
+}
+static int blend_addr(u32 a) { return a < 0x100 || (a >= 0x400 && a < 0x460) || (a >= 0x1020 && a <= 0x1025); }
+static u64 g_ip_total, g_ip_blended, g_ip_moved, g_ip_dtotal, g_ip_dblend; static float g_ip_maxd;
+static void replay(float t) {
+    Arena* cur = &g_log[g_cur];
+    st_load(&g_start[g_cur]);
+    {   /* the real frame started on an EFB cleared by the previous XFB copy: start the replay the same way */
+        u32 ar = bp[0x4F], gb = bp[0x50], cz = bp[0x51] & 0xFFFFFF;
+        u32 cc = (ar & 255) | ((gb >> 8) & 255) << 8 | (gb & 255) << 16 | ((ar >> 8) & 255) << 24;
+        gl_clear(0, 0, EFB_W, EFB_H, cc, cz, 1, 1, 1);
+    }
+    g_kgen++;
+    int rec = g_rec; g_rec = 0;   /* the replayed commands must not be recorded into the log being replayed */
+    g_replay = 1;
+    for (size_t o = 0; o < cur->n;) {
+        const u32* e = (const u32*)(cur->b + o);
+        if ((e[0] & 0xFF) == EV_BP) { gx_bp(e[1]); o += 8; }
+        else if ((e[0] & 0xFF) == EV_XF) {
+            u32 a = e[1], n = e[2]; const u32* v = e + 3; u32 key = a << 5 | n;
+            const u32* pe = prev_match(key, key_next(key));
+            u32 out[16]; memcpy(out, v, 4 * n);
+            if (pe && blend_addr(a)) {
+                g_ip_total++;
+                int ok = 1; float f[16];
+                for (u32 i = 0; i < n && ok; i++) {
+                    float c, p; memcpy(&c, &v[i], 4); memcpy(&p, &pe[3 + i], 4);
+                    if (c != c || p != p) { ok = 0; break; }
+                    float d = fabsf(c - p), m = fmaxf(fabsf(c), fabsf(p));
+                    if (d > 0.5f + 0.35f * m) ok = 0;   /* jump: cut or a different object */
+                    f[i] = p + (c - p) * t;
+                }
+                if (ok) { g_ip_blended++; for (u32 i = 0; i < n; i++) { float c; memcpy(&c, &v[i], 4); float d = fabsf(f[i] - c); if (d > g_ip_maxd) g_ip_maxd = d; if (d > 1e-6f) g_ip_moved++; memcpy(&out[i], &f[i], 4); } }
+            }
+            for (u32 i = 0; i < n; i++) xf_store(a + i, out[i]);
+            o += 12 + 4 * n;
+        } else {
+            /* vertices arrive already in camera space (the game transforms on the CPU), so the motion is in the
+               vertex positions: blend them with the matching draw of the previous frame */
+            const InV* in = (const InV*)(e + 4); int cnt = (int)e[3];
+            u32 key = draw_key(e); const u32* pe = prev_match(key, key_next(key));
+            const InV* use = in;
+            if (pe && pe[3] == e[3]) {
+                const InV* pv = (const InV*)(pe + 4); int ok = 1;
+                g_ip_dtotal++;
+                for (int i = 0; i < cnt && ok; i++) for (int k = 0; k < 3; k++) {
+                    float c = in[i].pos[k], p = pv[i].pos[k], d = fabsf(c - p), m = fmaxf(fabsf(c), fabsf(p));
+                    if (c != c || p != p || d > 8.0f + 0.25f * m) { ok = 0; break; }
+                }
+                if (ok) {
+                    static InV tmp[65536];
+                    for (int i = 0; i < cnt; i++) { tmp[i] = in[i]; for (int k = 0; k < 3; k++) { tmp[i].pos[k] = pv[i].pos[k] + (in[i].pos[k] - pv[i].pos[k]) * t; tmp[i].nrm[k] = pv[i].nrm[k] + (in[i].nrm[k] - pv[i].nrm[k]) * t; } }
+                    use = tmp; g_ip_dblend++;
+                }
+            }
+            draw_core((int)e[1], (int)e[2], cnt, use, 0, 0); o += 16 + sizeof(InV) * e[3];
+        }
+    }
+    g_replay = 0; g_rec = rec;
+}
+void interp_replay_xfb(void) {   /* the replayed frame reached its XFB copy: show it */
+    extern int g_dump_every; extern int g_frame_no_pub;
+    extern int dump_this(int frame);
+    if (dump_this(g_frame_no_pub + 1)) {   /* headless check: dump the in-between frame too */
+        static u32 keep[EFB_W * 480]; memcpy(keep, efb_c, sizeof keep);   /* efb_c holds the real frame for its own dump */
+        gl_read_efb(efb_c, 0, 0, 640, 480); char p[64]; snprintf(p, sizeof p, "frames/i%05d.ppm", g_frame_no_pub + 1); gx_dump_efb(p, 640, 480);
+        memcpy(efb_c, keep, sizeof keep);
+    }
+    platform_present();
+}
+/* one VI later: show the real frame that was held back */
+void interp_vi(void) {
+    if (!g_pending_real) return;
+    g_pending_real = 0;
+    extern void gl_show_saved(int on); gl_show_saved(1); platform_present(); gl_show_saved(0);
+}
+static void interp_frame_done(void) {
+    extern void gl_save_real(void); extern void gl_show_saved(int on);
+    gl_save_real();
+    int late = g_pending_real;
+    if (late) { g_pending_real = 0; gl_show_saved(1); platform_present(); gl_show_saved(0); }   /* the previous real frame never got its own field */
+    if (g_prev_ok && !late) {
+        GxState end; st_save(&end);
+        { static float t = -1; if (t < 0) { const char* e = getenv("SOA_INTERP_T"); t = e ? (float)atof(e) : 0.5f; } replay(t); }
+        st_load(&end);
+        g_pending_real = 1;
+    } else if (!late) { gl_show_saved(1); platform_present(); gl_show_saved(0); }
+    index_log(&g_log[g_cur]);   /* the finished log becomes "previous" */
+    g_cur ^= 1; g_log[g_cur].n = 0; st_save(&g_start[g_cur]); g_prev_ok = 1;
+    { extern void gl_copies_frame_start(void); gl_copies_frame_start(); }
+    { static u64 t0; u64 now = host_tb(); if (now - t0 > 5ull * 40500000ull) { if (t0) rt_log("interp: matrices %llu/%llu blended (%llu values moved, max %.3f), draws %llu/%llu blended\n", (unsigned long long)g_ip_blended, (unsigned long long)g_ip_total, (unsigned long long)g_ip_moved, g_ip_maxd, (unsigned long long)g_ip_dblend, (unsigned long long)g_ip_dtotal); t0 = now; g_ip_total = g_ip_blended = g_ip_moved = g_ip_dtotal = g_ip_dblend = 0; g_ip_maxd = 0; } }
+}
+
 void gx_frame_done(int w, int h) {
     g_tex_epoch++;
+    if (g_interp < 0) {
+        extern int settings_get(const char*, int); g_interp = settings_get("fps60", 1); if (getenv("SOA_INTERP")) g_interp = atoi(getenv("SOA_INTERP"));
+        if (!g_use_gl) g_interp = 0;
+        if (g_interp) { rt_log("60 fps frame interpolation on\n"); g_rec = 1; g_log[g_cur].n = 0; st_save(&g_start[g_cur]); }
+    } else if (g_interp && g_use_gl) interp_frame_done();
+    if (g_interp > 0 && g_use_gl) goto presented;
     { extern u64 g_pf_present; u64 t = host_tb(); if (g_use_gl) platform_present(); g_pf_present += host_tb() - t; }
+presented:;
     {   /* every ~5 s: frame rate and where the host time went (ms per frame) */
         extern u64 g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle; static u64 t0, n;
         u64 now = host_tb(); n++;
@@ -839,7 +1032,7 @@ void gx_frame_done(int w, int h) {
         if (m[0] > 2 * m[1] + 4800 * 10 && m[0] > 60 * 4800) { armed = 0; g_dbgf = g_frame_no + 1; rt_log("red frame %d detected, tracing next\n", g_frame_no); gx_dump_efb("frames/red_before.ppm", 640, 480); } } }
     { static int bt = -1; if (bt < 0) { const char* e = getenv("SOA_BT_FRAME"); bt = e ? atoi(e) : 0; }
       if (bt && g_frame_no == bt) { extern void rt_backtrace(Ctx*); rt_log("backtrace at frame %d\n", bt); rt_backtrace(g_ctx); } }
-    if (g_dump_every && g_frame_no % g_dump_every == 0) {
+    if (dump_this(g_frame_no)) {
         char p[64]; snprintf(p, sizeof p, "frames/f%05d.ppm", g_frame_no);
         gx_dump_efb(p, w, h);
     }

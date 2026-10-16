@@ -227,7 +227,9 @@ int settings_get(const char* key, int def) {
                   "window_width = 1280\n"
                   "window_height = 960\n"
                   "# pal60: 1 = let the game use its 60 Hz (EuRGB60) mode, 0 = 50 Hz PAL\n"
-                  "pal60 = 1\n", f);
+                  "pal60 = 1\n"
+                  "# fps60: 1 = 60 fps through frame interpolation (the game itself steps at 30)\n"
+                  "fps60 = 1\n", f);
             fclose(f);
         }
     }
