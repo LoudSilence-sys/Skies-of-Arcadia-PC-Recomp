@@ -342,6 +342,7 @@ void gl_flush(void) {
     for (int m = 0; m < 8; m++) if (used & (1u << m)) bind_tex(m);
     /* depth */
     u32 zm = bp[0x40];
+    { extern int g_exp; if (g_exp & 2) zm = 0; }
     if (zm & 1) { static const GLenum f[8] = {GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS}; glEnable(GL_DEPTH_TEST); glDepthFunc(f[(zm >> 1) & 7]); glDepthMask((zm >> 4) & 1); }
     else { glDisable(GL_DEPTH_TEST); glDepthMask(0); }
     /* blend */

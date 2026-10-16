@@ -20,7 +20,7 @@ static u32 bp[256];
 static u32 xf_mem[0x1000];         /* 0x0000-0x0FFF: matrices, normals, post, lights */
 static u32 xf_reg[0x100];          /* 0x1000-0x10FF */
 static u8 tmem[1 << 20];
-u64 g_tris;
+u64 g_tris; int g_exp = -1; u32 g_rej[3];   /* SOA_EXP debug knobs: 1 no culling, 2 no depth test */
 
 static float xff(u32 a) { u32 v = a < 0x1000 ? xf_mem[a] : xf_reg[a & 0xFF]; float f; memcpy(&f, &v, 4); return f; }
 
@@ -48,6 +48,7 @@ void gx_bp(u32 v) {
     if (r == 0xFE) { bp[0xFE] = val; return; }                        /* BP mask for next write */
     if (bp[0xFE]) { u32 m = bp[0xFE]; val = (bp[r] & ~m) | (val & m); bp[0xFE] = 0; }
     bp[r] = val;
+    if (r >= 0xE0 && r <= 0xE7) { extern u32 g_tevcol[2][8]; g_tevcol[(val >> 23) & 1][r - 0xE0] = val; }   /* TEV color registers and konst colors share these addresses */
     if (r == 0x52) efb_copy(val);
     if (r == 0x65) load_tlut();
     if (r == 0x63 && val) {   /* TMEM preload (GXPreLoadEntireTexture), as Dolphin */
@@ -317,12 +318,13 @@ static void sample(int map, float s, float t, float* out) {
 
 /* ---------------- TEV ---------------- */
 static int s11(u32 v) { v &= 0x7FF; return v & 0x400 ? (int)v - 0x800 : (int)v; }
+u32 g_tevcol[2][8];   /* [0] = TEV registers, [1] = konst colors; RA/BG words per register */
 static void tev_regs(float reg[4][4], float konst[4][4]) {
-    for (int i = 0; i < 4; i++) {
-        u32 ra = bp[0xE0 + 2 * i], bg = bp[0xE1 + 2 * i];
-        float r = s11(ra) / 255.f, a = s11(ra >> 12) / 255.f, b = s11(bg) / 255.f, g = s11(bg >> 12) / 255.f;
-        float* dst = (ra >> 23) & 1 ? konst[i] : reg[i];
-        dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 4; i++) {
+        u32 ra = g_tevcol[k][2 * i], bg = g_tevcol[k][2 * i + 1];
+        float* dst = k ? konst[i] : reg[i];
+        if (k) { dst[0] = (ra & 0xFF) / 255.f; dst[3] = ((ra >> 12) & 0xFF) / 255.f; dst[2] = (bg & 0xFF) / 255.f; dst[1] = ((bg >> 12) & 0xFF) / 255.f; }
+        else { dst[0] = s11(ra) / 255.f; dst[3] = s11(ra >> 12) / 255.f; dst[2] = s11(bg) / 255.f; dst[1] = s11(bg >> 12) / 255.f; }
     }
 }
 typedef struct { float reg[4][4], konst[4][4]; int init; } TevState;
@@ -512,10 +514,6 @@ static float bfac(int f, const float* s, const float* d, int k, int is_src) {
 static void raster_tri(const SV* a, const SV* b, const SV* c) {
     float area = (b->x - a->x) * (c->y - a->y) - (c->x - a->x) * (b->y - a->y);
     if (area == 0) return;
-    int cull = (bp[0x00] >> 14) & 3;
-    if (cull == 3) return;
-    if (cull == 1 && area > 0) return;     /* back faces (GX: CW front in screen space with y down) */
-    if (cull == 2 && area < 0) return;
     g_tris++;
     u32 sc0 = bp[0x20], sc1 = bp[0x21], sco = bp[0x59];
     int sy0 = (sc0 & 0x7FF) - 342, sx0 = ((sc0 >> 12) & 0x7FF) - 342, sy1 = (sc1 & 0x7FF) - 342, sx1 = ((sc1 >> 12) & 0x7FF) - 342;
@@ -580,8 +578,19 @@ static void lerpv(const OutV* a, const OutV* b, float t, OutV* o) {
     const float* pa = (const float*)a; const float* pb = (const float*)b; float* po = (float*)o;
     for (size_t i = 0; i < sizeof(OutV) / sizeof(float); i++) po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
+/* face culling, as Dolphin's software clipper: sign of the clip-space normal, inverted for a positive viewport height.
+   GenMode cull 1 drops triangles that are not "backface" by this test, cull 2 drops "backface" ones, 3 drops all. */
+static int cull_reject(const OutV* v0, const OutV* v1, const OutV* v2) {
+    int cull = (bp[0x00] >> 14) & 3; if (g_exp & 1) cull = 0;
+    if (cull == 0) return 0; if (cull == 3) return 1;
+    float nz = (v0->x * v2->w - v2->x * v0->w) * v1->y + (v2->x * v0->y - v0->x * v2->y) * v1->w + (v2->y * v0->w - v0->y * v2->w) * v1->x;
+    int back = nz <= 0; if (xff(0x101B) > 0) back = !back;
+    return cull == 1 ? !back : back;
+}
 /* clip against near plane (z <= 0 in GX clip space means visible: -w <= z <= 0) */
 static void clip_tri(const OutV* a, const OutV* b, const OutV* c) {
+    if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
+    if (cull_reject(a, b, c)) { g_rej[2]++; return; }
     OutV in[8], out[8]; int n = 3; in[0] = *a; in[1] = *b; in[2] = *c;
     int m = 0;
     for (int i = 0; i < n; i++) {
@@ -590,12 +599,10 @@ static void clip_tri(const OutV* a, const OutV* b, const OutV* c) {
         if (dp >= 0) out[m++] = *p;
         if ((dp >= 0) != (dq >= 0)) { float t = dp / (dp - dq); lerpv(p, q, t, &out[m++]); }
     }
-    if (m < 3) return;
-    SV s[8]; for (int i = 0; i < m; i++) { if (out[i].w <= 0) return; to_screen(&out[i], &s[i]); }
+    if (m < 3) { g_rej[0]++; return; }
+    SV s[8]; for (int i = 0; i < m; i++) { if (out[i].w <= 0) { g_rej[1]++; return; } to_screen(&out[i], &s[i]); }
     if (g_use_gl) {
-        int cull = (bp[0x00] >> 14) & 3; if (cull == 3) return;
-        float area = (s[1].x - s[0].x) * (s[2].y - s[0].y) - (s[2].x - s[0].x) * (s[1].y - s[0].y);
-        if (cull == 1 && area > 0) return; if (cull == 2 && area < 0) return;
+
         g_tris++;
         for (int i = 1; i + 1 < m; i++) {
             int idx[3] = {0, i, i + 1};
@@ -651,6 +658,8 @@ void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     if (!g_tev.init || 1) { tev_regs(g_tev.reg, g_tev.konst); g_tev.init = 1; }
     const u8* p = data;
     for (int i = 0; i < count; i++) { InV in; const u8* q = decode_vertex(p, vat, &in); (void)q; p += vsize; transform(&in, &vs[i]); }
+    if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
+    u64 tris0 = g_tris; g_rej[0] = g_rej[1] = g_rej[2] = 0;
     switch (prim) {
     case 0: for (int i = 0; i + 3 < count; i += 4) { clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); clip_tri(&vs[i], &vs[i + 2], &vs[i + 3]); } break;
     case 2: for (int i = 0; i + 2 < count; i += 3) clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); break;
@@ -670,13 +679,15 @@ void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
         if (g_use_gl) gl_read_efb(efb_c, 0, 0, 640, 480);
         double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         int ns = ((bp[0] >> 10) & 15) + 1;
-        rt_log("D%d prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X %06X ras0 %08X %08X ind %06X fog %06X\n", nd, prim, count, vat,
+        rt_log("D%d tris %d rej %u/%u/%u prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X %06X ras0 %08X %08X ind %06X fog %06X\n", nd, (int)(g_tris - tris0), g_rej[0], g_rej[1], g_rej[2], prim, count, vat,
             m[0] / 4800, m[1] / 4800, m[2] / 4800, bp[0], ns, bp[0x41], bp[0x40], bp[0xF3], bp[0x43], bp[0xC0], bp[0xC1], bp[0x28], bp[0x29], xf_reg[0x0E], xf_reg[0x0C], bp[0x10], bp[0xF2]);
         { float bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9, amin = 9, amax = -9; const u8* pp = data;
           for (int i = 0; i < count && i < 64; i++) { InV iv; decode_vertex(pp, vat, &iv); pp += vsize; OutV ov; transform(&iv, &ov); SV sv; to_screen(&ov, &sv);
             if (sv.x < bx0) bx0 = sv.x; if (sv.x > bx1) bx1 = sv.x; if (sv.y < by0) by0 = sv.y; if (sv.y > by1) by1 = sv.y; float a = ov.col[0][3]; if (a < amin) amin = a; if (a > amax) amax = a; }
           { InV iv; decode_vertex(data, vat, &iv); OutV ov; transform(&iv, &ov); SV sv; to_screen(&ov, &sv); rt_log("   z0 %.1f w %.4f clipz %.4f vp %f %f proj %u %f %f\n", sv.z, ov.w, ov.z, xff(0x101C), xff(0x101F), xf_reg[0x26], xff(0x1024), xff(0x1025)); }
-          rt_log("   bbox %.0f,%.0f - %.0f,%.0f  alpha %.3f..%.3f  vsize %d\n", bx0, by0, bx1, by1, amin, amax, vsize); }
+          { const u8* pq = data; for (int i = 0; i < count && i < 4; i++) { InV iv; decode_vertex(pq, vat, &iv); pq += vsize; OutV ov; transform(&iv, &ov); rt_log("   vtx%d pos %.2f %.2f %.2f -> clip %.3f %.3f %.3f %.3f\n", i, iv.pos[0], iv.pos[1], iv.pos[2], ov.x, ov.y, ov.z, ov.w); } }
+          rt_log("   bbox %.0f,%.0f - %.0f,%.0f  alpha %.3f..%.3f  vsize %d\n", bx0, by0, bx1, by1, amin, amax, vsize);
+          rt_log("   konst %08X %08X %08X %08X | %08X %08X | ksel %06X %06X | reg0 %08X %08X | zm %06X sc %06X %06X\n", g_tevcol[1][0], g_tevcol[1][1], g_tevcol[1][2], g_tevcol[1][3], g_tevcol[1][6], g_tevcol[1][7], bp[0xF6], bp[0xF7], g_tevcol[0][0], g_tevcol[0][1], bp[0x40], bp[0x20], bp[0x21]); }
         { InV iv; decode_vertex(data, vat, &iv); OutV ov; transform(&iv, &ov); float sc[4] = {0, 0, 0, 0}; float q = ov.tex[0][2] ? ov.tex[0][2] : 1; sample(0, ov.tex[0][0] / q, ov.tex[0][1] / q, sc);
           rt_log("   v0: in tex %.4f %.4f tmi %d -> %.4f %.4f %.4f  sample %.2f %.2f %.2f %.2f texgen %08X vcd hi %08X\n", iv.tex[0][0], iv.tex[0][1], iv.tmi[0], ov.tex[0][0], ov.tex[0][1], ov.tex[0][2], sc[0], sc[1], sc[2], sc[3], xf_reg[0x40], g_cp_regs[0x60]); }
         { InV iv; decode_vertex(data, vat, &iv); rt_log("   xf: ctl c0 %08X a0 %08X c1 %08X a1 %08X mat %08X %08X amb %08X %08X nchan %u | vcd %08X vatA %08X | v0 col %.3f %.3f %.3f %.3f\n", xf_reg[0x0E], xf_reg[0x10], xf_reg[0x0F], xf_reg[0x11], xf_reg[0x0C], xf_reg[0x0D], xf_reg[0x0A], xf_reg[0x0B], xf_reg[0x09], g_cp_regs[0x50], g_cp_regs[0x70 + vat], iv.col[0][0], iv.col[0][1], iv.col[0][2], iv.col[0][3]); }
