@@ -34,7 +34,7 @@ void options_toggle(void) { if (g_open) options_close(); else options_open(); }
 static int val(int i) {
     switch (i) {
     case O_RES: return settings_get("resolution_scale", 3);
-    case O_WIDE: return settings_get("widescreen", 1);
+    case O_WIDE: return settings_get("widescreen", 0);
     case O_FULL: return platform_get_fullscreen();
     case O_VSYNC: return settings_get("vsync", 0);
     case O_FPS60: return settings_get("fps60", 1);
@@ -107,7 +107,7 @@ void options_draw(float x, float y, float w, float h) {
         text(wx + 40, ry, 22, names[i], white);
         char v[48]; int n = val(i);
         switch (i) {
-        case O_RES: { int ws = settings_get("widescreen", 1); snprintf(v, sizeof v, "%dx  %dx%d%s", n, ws ? 640 * n * 4 / 3 : 640 * n, 480 * n, n == 5 ? " (4K)" : ""); break; }
+        case O_RES: { int ws = settings_get("widescreen", 0); snprintf(v, sizeof v, "%dx  %dx%d%s", n, ws ? 640 * n * 4 / 3 : 640 * n, 480 * n, n == 5 ? " (4K)" : ""); break; }
         case O_HZ: snprintf(v, sizeof v, "%s", n ? "60 Hz" : "50 Hz"); break;
         case O_DC: snprintf(v, sizeof v, "%s", n ? "Dreamcast" : "GameCube"); break;
         default: snprintf(v, sizeof v, "%s", n ? "On" : "Off"); break;

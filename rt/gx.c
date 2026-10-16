@@ -23,6 +23,8 @@ static u32 xf_reg[0x100];          /* 0x1000-0x10FF */
 static u8 tmem[1 << 20];
 u64 host_tb(void);
 void platform_present(void);
+void gl_flush(void);
+extern int g_use_gl;
 u32 g_tex_epoch = 1;   /* see bind_tex: advances whenever texture memory may have changed */
 u64 g_tris; int g_exp = -1; u32 g_rej[3];   /* SOA_EXP debug knobs: 1 no culling, 2 no depth test */
 
@@ -62,6 +64,13 @@ void gx_bp(u32 v) {
     u8 r = v >> 24; u32 val = v & 0xFFFFFF;
     if (r == 0xFE) { bp[0xFE] = val; return; }                        /* BP mask for next write */
     if (bp[0xFE]) { u32 m = bp[0xFE]; val = (bp[r] & ~m) | (val & m); bp[0xFE] = 0; }
+    /* draws are batched: queued vertices are drawn with the state they were queued under, so flush before any
+       register actually changes (the GL backend reads the BP registers when it flushes) */
+    if (g_use_gl) {
+        extern u32 g_tevcol[2][8];
+        int changed = (r >= 0xE0 && r <= 0xE7) ? g_tevcol[(val >> 23) & 1][r - 0xE0] != val : bp[r] != val;
+        if (changed || r == 0x52 || r == 0x63 || r == 0x65 || r == 0x45 || r == 0x48 || r == 0x47) gl_flush();
+    }
     bp[r] = val;
     if (r >= 0xE0 && r <= 0xE7) { extern u32 g_tevcol[2][8]; g_tevcol[(val >> 23) & 1][r - 0xE0] = val; }   /* TEV color registers and konst colors share these addresses */
     if (r == 0x52) { efb_copy(val); g_tex_epoch++; }
@@ -693,7 +702,10 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
     if (g_use_gl) {   /* widescreen: squeeze into the wider EFB (it is stretched back on output) */
         extern int g_ws;
         if (g_ws) {
-            int squeeze = 1;
+            /* only draws into the full-screen viewport: render-to-texture passes (shadows, reflections, effects)
+               use smaller viewports and are copied out by EFB rectangle, so they must keep their shape */
+            float vw = fabsf(xff(0x101A)) * 2;
+            int squeeze = vw > 600.f;
             if (xf_reg[0x26] != 0) {   /* orthographic (2D): keep its shape, centred - unless it spans the whole width (fades, backdrops) */
                 float lo = 1e9f, hi = -1e9f;
                 for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; float x = vs[i].x / w; if (x < lo) lo = x; if (x > hi) hi = x; }
@@ -714,7 +726,6 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
     case 7: for (int i = 0; i < count; i++) draw_point(&vs[i]); break;
     default: break;
     }
-    if (g_use_gl) gl_flush();
     if (g_replay || !data) return;
     { extern int g_dbgf; int dbgf = g_dbgf; extern int g_frame_no_pub;
       static u32 dtex[4]; static int dtn = -1; if (dtn < 0) { dtn = 0; const char* e = getenv("SOA_DBGTEX"); if (e) dtn = sscanf(e, "%x,%x,%x,%x", &dtex[0], &dtex[1], &dtex[2], &dtex[3]); }
@@ -941,6 +952,7 @@ static int blend_addr(u32 a) { return a < 0x100 || (a >= 0x400 && a < 0x460) || 
 static u64 g_ip_total, g_ip_blended, g_ip_moved, g_ip_dtotal, g_ip_dblend; static float g_ip_maxd;
 static void replay(float t) {
     Arena* cur = &g_log[g_cur];
+    gl_flush();
     st_load(&g_start[g_cur]);
     {   /* the real frame started on an EFB cleared by the previous XFB copy: start the replay the same way */
         u32 ar = bp[0x4F], gb = bp[0x50], cz = bp[0x51] & 0xFFFFFF;
@@ -1012,14 +1024,18 @@ void interp_vi(void) {
     extern void gl_show_saved(int on); gl_show_saved(1); platform_present(); gl_show_saved(0);
 }
 static void interp_frame_done(void) {
-    extern void gl_save_real(void); extern void gl_show_saved(int on);
+    extern void gl_save_real(void); extern void gl_show_saved(int on); extern u64 g_frames;
     gl_save_real();
     int late = g_pending_real;
+    {   /* the game already shows a new frame every field (some cutscenes and menus): nothing to fill in */
+        static u64 last_vi; u64 vi = g_frames; int fields = (int)(vi - last_vi); last_vi = vi;
+        if (fields <= 1) late = 1;
+    }
     if (late) { g_pending_real = 0; gl_show_saved(1); platform_present(); gl_show_saved(0); }   /* the previous real frame never got its own field */
     if (g_prev_ok && !late) {
         GxState end; st_save(&end);
         { static float t = -1; if (t < 0) { const char* e = getenv("SOA_INTERP_T"); t = e ? (float)atof(e) : 0.5f; } replay(t); }
-        st_load(&end);
+        gl_flush(); st_load(&end);
         g_pending_real = 1;
     } else if (!late) { gl_show_saved(1); platform_present(); gl_show_saved(0); }
     index_log(&g_log[g_cur]);   /* the finished log becomes "previous" */
