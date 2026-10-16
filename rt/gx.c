@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
 void rt_log(const char* fmt, ...);
 int gx_vertex_size(int vat);
@@ -461,8 +462,10 @@ static u32 tex_bytes(u32 fmt, u32 w, u32 h) {
     u32 bx = (w + bw[fmt] - 1) / bw[fmt], by = (h + bh[fmt] - 1) / bh[fmt];
     return bx * by * (fmt == 6 ? 64 : 32);
 }
+WEAK void tex_bind_hook(u32 addr, u32 w, u32 h, u32 fmt) { (void)addr; (void)w; (void)h; (void)fmt; }
 int gx_tex_info(int map, u32* key, u32* w, u32* h, u32* mode0, u32* nbytes, u32* addr) {
     TexDesc d; get_tex(map, &d);
+    if (!d.tm) tex_bind_hook(d.addr, d.w, d.h, d.fmt);
     int b = map < 4 ? map : map - 4 + 0x20;
     *w = d.w; *h = d.h; *mode0 = bp[0x80 + b]; *addr = d.addr; *nbytes = tex_bytes(d.fmt, d.w, d.h);
     key[0] = d.addr; key[1] = d.w | d.h << 16; key[2] = d.fmt | d.tlut_fmt << 4 | d.tlut_off << 8; key[3] = 0;
@@ -706,6 +709,7 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
       int texhit = 0; if (dtn > 0) { static int hits; TexDesc d0; get_tex(bp[0x28] & 7, &d0); for (int k = 0; k < dtn; k++) if (d0.addr == dtex[k] && hits < 40) { texhit = 1; hits++; } }
       if ((dbgf && g_frame_no_pub == dbgf) || texhit) {
         static int nd; nd++;
+        if (texhit) { extern void rt_backtrace(Ctx*); rt_backtrace(g_ctx); }
         if (g_use_gl) gl_read_efb(efb_c, 0, 0, 640, 480);
         double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         int ns = ((bp[0] >> 10) & 15) + 1;
@@ -770,6 +774,7 @@ static void efb_copy(u32 v) {
         int bw = bpp == 4 ? 8 : bpp == 8 ? 8 : 4, bh = bpp == 4 ? 8 : 4; u32 nb = (u32)((tw + bw - 1) / bw) * ((th + bh - 1) / bh) * (bpp == 32 ? 64 : 32);
         gpu_copy = gl_efb_copy_tex(sx, sy, w, h, half, fmt0, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb);
     }
+    if (g_use_gl && to_xfb && need_xfb_pixels) { extern void gl_overlay_into_efb(void); gl_overlay_into_efb(); }
     if (g_use_gl && !gpu_copy && (!to_xfb || need_xfb_pixels)) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb(efb_c, sx, sy, rw, rh); }
     if (to_xfb && !need_xfb_pixels) {
         g_xfb_ready = 1; g_xfb_addr = dst;
@@ -878,6 +883,11 @@ typedef struct { u32 bp[256]; u32 xf_mem[0x1000]; u32 xf_reg[0x100]; u32 tevcol[
 enum { EV_BP = 1, EV_XF = 2, EV_DRAW = 3 };
 static Arena g_log[2]; static GxState g_start[2]; static int g_cur, g_prev_ok, g_pending_real;
 int g_interp = -1;
+/* options screen: switch interpolation on or off while running */
+void interp_set(int on) {
+    if (!on) { g_interp = 0; g_rec = 0; g_pending_real = 0; g_prev_ok = 0; }
+    else if (g_interp == 0) g_interp = -1;   /* re-initialises on the next frame (reads settings fps60) */
+}
 int gx_replaying(void) { return g_replay; }
 typedef struct { u32 key, seq, off; } XKey;
 static XKey* g_pidx; static int g_pn, g_pcap;
@@ -1006,8 +1016,21 @@ static void interp_frame_done(void) {
     { static u64 t0; u64 now = host_tb(); if (now - t0 > 5ull * 40500000ull) { if (t0) rt_log("interp: matrices %llu/%llu blended (%llu values moved, max %.3f), draws %llu/%llu blended\n", (unsigned long long)g_ip_blended, (unsigned long long)g_ip_total, (unsigned long long)g_ip_moved, g_ip_maxd, (unsigned long long)g_ip_dblend, (unsigned long long)g_ip_dtotal); t0 = now; g_ip_total = g_ip_blended = g_ip_moved = g_ip_dtotal = g_ip_dblend = 0; g_ip_maxd = 0; } }
 }
 
+/* the options screen pauses the game: keep showing the last finished frame under it */
+void options_pause_loop(void) {
+#ifdef _WIN32
+    extern int options_is_open(void); extern void options_input(u32); extern u32 si_pad_hi_raw(void);
+    extern void platform_pump(void); extern void gl_show_saved(int on);
+    while (options_is_open()) {
+        platform_pump(); options_input(si_pad_hi_raw());
+        gl_show_saved(1); platform_present(); gl_show_saved(0);
+        usleep(16000);
+    }
+#endif
+}
 void gx_frame_done(int w, int h) {
     g_tex_epoch++;
+    if (g_use_gl && !g_interp) { extern void gl_save_real(void); gl_save_real(); }   /* (interpolation saves it itself) */
     if (g_interp < 0) {
         extern int settings_get(const char*, int); g_interp = settings_get("fps60", 1); if (getenv("SOA_INTERP")) g_interp = atoi(getenv("SOA_INTERP"));
         if (!g_use_gl) g_interp = 0;
@@ -1028,6 +1051,10 @@ presented:;
         }
     }
     dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
+    {   /* SOA_RAMDUMP=f1,f2,...: write main RAM to frames/ram_F.bin at those XFB frames */
+        static int fr[8], nfr = -1; if (nfr < 0) { nfr = 0; const char* e = getenv("SOA_RAMDUMP"); if (e) nfr = sscanf(e, "%d,%d,%d,%d,%d,%d,%d,%d", &fr[0], &fr[1], &fr[2], &fr[3], &fr[4], &fr[5], &fr[6], &fr[7]); }
+        for (int i = 0; i < nfr; i++) if (fr[i] == g_frame_no) { char p[64]; snprintf(p, sizeof p, "frames/ram_%d.bin", g_frame_no); FILE* f = fopen(p, "wb"); if (f) { fwrite(g_ram, 1, RAM_SIZE, f); fclose(f); } }
+    }
     { static int armed = 1; if (armed && getenv("SOA_REDDBG")) { double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         if (m[0] > 2 * m[1] + 4800 * 10 && m[0] > 60 * 4800) { armed = 0; g_dbgf = g_frame_no + 1; rt_log("red frame %d detected, tracing next\n", g_frame_no); gx_dump_efb("frames/red_before.ppm", 640, 480); } } }
     { static int bt = -1; if (bt < 0) { const char* e = getenv("SOA_BT_FRAME"); bt = e ? atoi(e) : 0; }

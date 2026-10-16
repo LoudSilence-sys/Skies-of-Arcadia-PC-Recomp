@@ -15,6 +15,10 @@ static HMODULE g_opengl32;
 static u8 g_keys[256];
 int settings_get(const char* key, int def);
 static int g_fullscreen; static RECT g_saved_rect;
+static void set_fullscreen(int on);
+void platform_set_fullscreen(int on) { set_fullscreen(on); }
+int platform_get_fullscreen(void) { return g_fullscreen; }
+void platform_set_vsync(int on) { typedef BOOL (WINAPI* PFNSWAP)(int); PFNSWAP swap = (PFNSWAP)wglGetProcAddress("wglSwapIntervalEXT"); if (swap) swap(on ? 1 : 0); }
 static void set_fullscreen(int on) {   /* borderless fullscreen on the window's monitor */
     if (on == g_fullscreen) return;
     if (on) {
@@ -40,6 +44,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CLOSE: ExitProcess(0); return 0;
     case WM_SIZE: g_win_w = LOWORD(l); g_win_h = HIWORD(l); return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        if (w == VK_F1) { extern void options_toggle(void); if (!(l & (1 << 30))) options_toggle(); return 0; }
         if (w == VK_F11 || (w == VK_RETURN && (l & (1 << 29)))) { if (!(l & (1 << 30))) set_fullscreen(!g_fullscreen); return 0; }   /* F11 / Alt+Enter */
         g_keys[w & 255] = 1; return 0;
     case WM_KEYUP: case WM_SYSKEYUP: g_keys[w & 255] = 0; return 0;

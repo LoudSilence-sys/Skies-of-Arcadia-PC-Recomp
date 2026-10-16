@@ -248,7 +248,11 @@ static int is_dc_id(u32 id) { return (id & 0xF0000000u) == 0x40000000u; }
 
 /* returns a fake sequence id, or 0xFFFFFFFF to let MusyX play it */
 static u32 dc_play_name(int s, const char* name, int song);
+static int g_dc_user = -1;   /* settings dc_sound / options screen: 0 = new sounds go to the GameCube path */
+void dcsnd_set_enabled(int on) { g_dc_user = on; }
 static u32 dc_play(u32 group, u32 songid) {
+    if (g_dc_user < 0) { extern int settings_get(const char*, int); g_dc_user = settings_get("dc_sound", 1); }
+    if (!g_dc_user) return 0xFFFFFFFFu;
     if (!g_tried) g_on = dcsnd_init();
     if (!g_on) return 0xFFFFFFFFu;
     int s = find_slot(group); if (s < 0) return 0xFFFFFFFFu;

@@ -551,8 +551,96 @@ void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alph
     glColorMask(1, 1, 1, 1);
 }
 
+static GLuint g_sfbo, g_stex;
+/* ---------------- UI overlay (options screen): screen-space quads, solid / RGBA image / font atlas ---------------- */
+static const char* UVS = "#version 330 core\nlayout(location=0) in vec2 p; layout(location=1) in vec2 t; layout(location=2) in vec4 c;\nuniform vec2 u_ss; out vec2 v_t; out vec4 v_c;\n"
+    "void main(){ v_t=t; v_c=c; gl_Position=vec4(p.x/u_ss.x*2.0-1.0, 1.0-p.y/u_ss.y*2.0, 0.0, 1.0); }\n";
+static const char* UFS = "#version 330 core\nin vec2 v_t; in vec4 v_c; out vec4 o; uniform sampler2D u_t; uniform int u_mode;\n"
+    "void main(){ if(u_mode==0) o=v_c; else if(u_mode==1) o=texture(u_t,v_t)*v_c; else o=vec4(v_c.rgb, v_c.a*texture(u_t,v_t).r); }\n";
+static GLuint g_uprog, g_uvao, g_uvbo, g_ufont, g_utitle; static GLint uu_ss, uu_mode, uu_t;
+static float g_uv[6 * 8 * 512]; static int g_un, g_umode = -1; static float g_uw, g_uh;
+extern const int g_uifont_cw, g_uifont_ch, g_uifont_cols, g_uifont_w, g_uifont_h; extern const unsigned char g_uifont_adv[95], g_uifont[];
+extern const unsigned char g_options_title[];
+static void ui_flush(void) {
+    if (!g_un) return;
+    glBindBuffer(GL_ARRAY_BUFFER, g_uvbo); glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_un * 8 * 4, g_uv, GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, g_un); g_un = 0;
+}
+static void ui_mode(int m, GLuint tex) {
+    if (m != g_umode || m) { ui_flush(); g_umode = m; glUniform1i(uu_mode, m); if (m) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); } }
+}
+static void ui_vtx(float x, float y, float u, float v, const float* c) { if (g_un >= 6 * 512) ui_flush(); float* q = g_uv + g_un * 8; q[0] = x; q[1] = y; q[2] = u; q[3] = v; q[4] = c[0]; q[5] = c[1]; q[6] = c[2]; q[7] = c[3]; g_un++; }
+static void ui_quad(float x, float y, float w, float h, float u0, float v0, float u1, float v1, const float* ct, const float* cb) {
+    ui_vtx(x, y, u0, v0, ct); ui_vtx(x + w, y, u1, v0, ct); ui_vtx(x, y + h, u0, v1, cb);
+    ui_vtx(x + w, y, u1, v0, ct); ui_vtx(x + w, y + h, u1, v1, cb); ui_vtx(x, y + h, u0, v1, cb);
+}
+void ui_begin(int w, int h) {
+    if (!g_uprog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, UVS), fs = compile(GL_FRAGMENT_SHADER, UFS);
+        g_uprog = glCreateProgram(); glAttachShader(g_uprog, vs); glAttachShader(g_uprog, fs); glLinkProgram(g_uprog);
+        uu_ss = glGetUniformLocation(g_uprog, "u_ss"); uu_mode = glGetUniformLocation(g_uprog, "u_mode"); uu_t = glGetUniformLocation(g_uprog, "u_t");
+        glGenVertexArrays(1, &g_uvao); glBindVertexArray(g_uvao); glGenBuffers(1, &g_uvbo); glBindBuffer(GL_ARRAY_BUFFER, g_uvbo);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, 0, 32, (void*)0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, 0, 32, (void*)8);
+        glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, 0, 32, (void*)16);
+        glGenTextures(1, &g_ufont); glBindTexture(GL_TEXTURE_2D, g_ufont);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, g_uifont_w, g_uifont_h, 0, GL_RED, GL_UNSIGNED_BYTE, g_uifont);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glGenTextures(1, &g_utitle); glBindTexture(GL_TEXTURE_2D, g_utitle);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 312, 80, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_options_title);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    gl_flush();
+    glViewport(0, 0, w, h); glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_COLOR_LOGIC_OP); glColorMask(1, 1, 1, 1);
+    glEnable(GL_BLEND); glBlendEquation(GL_FUNC_ADD); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_uprog); glBindVertexArray(g_uvao); { float ss[2] = {(float)w, (float)h}; glUniform2fv(uu_ss, 1, ss); } glUniform1i(uu_t, 0);
+    g_umode = -1; g_un = 0; g_uw = (float)w; g_uh = (float)h;
+}
+void ui_rect(float x, float y, float w, float h, const float* ct, const float* cb) { ui_mode(0, 0); ui_quad(x, y, w, h, 0, 0, 0, 0, ct, cb); }
+void ui_title(float x, float y, float w, float h, float a) { float c[4] = {1, 1, 1, a}; ui_mode(1, g_utitle); ui_quad(x, y, w, h, 0, 0, 1, 1, c, c); }
+float ui_text_width(const char* s, float size) { float k = size / 26.f, x = 0; for (; *s; s++) { int ch = (unsigned char)*s - 32; if (ch >= 0 && ch < 95) x += g_uifont_adv[ch] * k; } return x; }
+void ui_text(float x, float y, float size, const char* s, const float* c) {
+    ui_mode(2, g_ufont); float k = size / 26.f;
+    for (; *s; s++) {
+        int ch = (unsigned char)*s - 32; if (ch < 0 || ch >= 95) continue;
+        float u0 = (float)((ch % g_uifont_cols) * g_uifont_cw) / g_uifont_w, v0 = (float)((ch / g_uifont_cols) * g_uifont_ch) / g_uifont_h;
+        ui_quad(x, y, g_uifont_cw * k, g_uifont_ch * k, u0, v0, u0 + (float)g_uifont_cw / g_uifont_w, v0 + (float)g_uifont_ch / g_uifont_h, c, c);
+        x += g_uifont_adv[ch] * k;
+    }
+}
+void ui_end(void) { ui_flush(); glDisable(GL_BLEND); glBindVertexArray(g_vao); glUseProgram(g_prog); glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH); }
+/* the options screen draws itself into a 4:3 rectangle of the current framebuffer */
+WEAK void options_draw(float x, float y, float w, float h) { (void)x; (void)y; (void)w; (void)h; }
+WEAK int options_is_open(void) { return 0; }
+/* headless runs: draw the overlay into the EFB so frame dumps show it */
+void gl_overlay_into_efb(void) {
+    if (!options_is_open()) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    ui_begin(SW, SH); options_draw(0, (float)((EFB_H - 480) * g_scale) * 0 , 640.f * g_scale, 480.f * g_scale); ui_end();
+}
+/* live resolution change: recreate the EFB at the new scale */
+void gl_set_scale(int s) {
+    if (s < 1) s = 1; if (s > 8) s = 8; if (s == g_scale) return;
+    gl_flush(); int old = g_scale; g_scale = s;
+    glBindTexture(GL_TEXTURE_2D, g_fbtex); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_fbdepth); glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, SW, SH);
+    if (g_stex) {   /* keep the paused frame visible under the options screen: rescale it into a new texture */
+        int ow = EFB_W * old, oh = EFB_H * old;
+        GLuint nt, nf; glGenTextures(1, &nt); glBindTexture(GL_TEXTURE_2D, nt); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glGenFramebuffers(1, &nf); glBindFramebuffer(GL_FRAMEBUFFER, nf); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nt, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_sfbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, nf);
+        glBlitFramebuffer(0, 0, ow, oh, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glDeleteFramebuffers(1, &g_sfbo); glDeleteTextures(1, &g_stex); g_sfbo = nf; g_stex = nt;
+    }
+    glUseProgram(g_prog); glUniform1f(u_scale, (float)g_scale);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH);
+    rt_log("GL: internal resolution %dx%d\n", 640 * s, 480 * s);
+}
+
 /* frame interpolation: the real frame is kept in a texture while the in-between frame is shown */
-static GLuint g_sfbo, g_stex; static int g_show_saved;
+static int g_show_saved;
 void gl_save_real(void) {
     gl_flush();
     if (!g_sfbo) {
@@ -575,5 +663,6 @@ void gl_blit_to_screen(int w, int h) {
     int dx = (w - dw) / 2, dy = (h - dh) / 2;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
     glBlitFramebuffer(0, (EFB_H - 480) * g_scale, 640 * g_scale, EFB_H * g_scale, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (options_is_open()) { glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h); options_draw((float)dx, (float)(h - dy - dh), (float)dw, (float)dh); ui_end(); }
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
 }

@@ -238,6 +238,29 @@ int settings_get(const char* key, int def) {
     return def;
 }
 
+void settings_set(const char* key, int v) {
+    settings_get(key, 0);
+    for (int i = 0; i < g_set_n; i++) if (!strcmp(g_set_k[i], key)) { g_set_v[i] = v; return; }
+    if (g_set_n < 64) { snprintf(g_set_k[g_set_n], 48, "%s", key); g_set_v[g_set_n++] = v; }
+}
+/* rewrite settings.ini from the current values (the options screen saves through this) */
+void settings_save(void) {
+    static const char* doc[][2] = {
+        {"resolution_scale", "internal rendering resolution, 1 = native 640x480, 2 = 1280x960, 3 = 1920x1440, 4 = 2560x1920, 5 = 3200x2400, 6 = 3840x2880"},
+        {"fullscreen", "1 = start in borderless fullscreen (F11 or Alt+Enter toggles in game)"},
+        {"vsync", "1 = sync presentation to the display"},
+        {"window_width", "window size at startup"}, {"window_height", 0},
+        {"pal60", "1 = let the game use its 60 Hz (EuRGB60) mode, 0 = 50 Hz PAL"},
+        {"fps60", "1 = 60 fps through frame interpolation (the game itself steps at 30)"},
+        {"dc_sound", "1 = Dreamcast music and sound effects (needs dc_path.txt), 0 = GameCube"},
+    };
+    FILE* f = fopen("settings.ini", "w"); if (!f) return;
+    fputs("# Skies of Arcadia Legends (recompiled) settings - also editable in game: title screen > Options, or F1\n", f);
+    static const int defs[] = {3, 0, 0, 1280, 960, 1, 1, 1};
+    for (unsigned i = 0; i < sizeof doc / sizeof doc[0]; i++) { if (doc[i][1]) fprintf(f, "# %s: %s\n", doc[i][0], doc[i][1]); fprintf(f, "%s = %d\n", doc[i][0], settings_get(doc[i][0], defs[i])); }
+    fclose(f);
+}
+
 int main(int argc, char** argv) {
 #ifndef _WIN32
     if (getenv("SOA_PROF")) {

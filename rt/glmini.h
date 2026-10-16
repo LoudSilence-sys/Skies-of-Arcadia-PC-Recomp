@@ -35,6 +35,8 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_UNSIGNED_BYTE 0x1401
 #define GL_FLOAT 0x1406
+#define GL_RED 0x1903
+#define GL_R8 0x8229
 #define GL_RGBA 0x1908
 #define GL_RGBA8 0x8058
 #define GL_NEAREST 0x2600
@@ -105,7 +107,7 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
   X(void, glRenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) X(void, glFramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
   X(void, glBlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
   X(const GLubyte*, glGetString, (GLenum)) X(void, glFinish, (void)) X(GLenum, glGetError, (void)) \
-  X(void, glLogicOp, (GLenum)) X(void, glUniform3fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1f, (GLint, GLfloat)) X(void, glUniform2fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1ui, (GLint, GLuint)) X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*))
+  X(void, glLogicOp, (GLenum)) X(void, glUniform3fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1f, (GLint, GLfloat)) X(void, glDeleteFramebuffers, (GLsizei, const GLuint*)) X(void, glUniform2f, (GLint, GLfloat, GLfloat)) X(void, glUniform2fv, (GLint, GLsizei, const GLfloat*)) X(void, glUniform1ui, (GLint, GLuint)) X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*))
 
 #define GLDECL(ret, name, args) typedef ret (*PFN_##name) args; extern PFN_##name name;
 GLFUNCS(GLDECL)

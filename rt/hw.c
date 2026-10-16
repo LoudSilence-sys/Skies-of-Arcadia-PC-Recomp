@@ -347,6 +347,11 @@ static int g_si_pending; static u64 g_si_done_at;
 static int g_ar_pending; static u64 g_ar_done_at;
 static u32 g_pad_hi = 0x00808080, g_pad_lo = 0x80800000;   /* neutral */
 void si_set_pad(u32 hi, u32 lo) { g_pad_hi = hi; g_pad_lo = lo; }
+u32 si_pad_hi_raw(void) { return g_pad_hi; }
+int options_is_open(void);
+/* what the game sees: nothing while the options screen has the controller */
+static u32 pad_hi(void) { return options_is_open() ? 0x00808080u : g_pad_hi; }
+static u32 pad_lo(void) { return options_is_open() ? 0x80800000u : g_pad_lo; }
 static void si_transfer(u32 csr) {
     int chn = (csr >> 1) & 3;
     u8 buf[128]; for (int i = 0; i < 128; i += 2) { u16 w = R16REG(0x6480 + i); buf[i] = w >> 8; buf[i + 1] = (u8)w; }
@@ -355,7 +360,7 @@ static void si_transfer(u32 csr) {
     if (chn != 0) { w32reg(0x6438, r32reg(0x6438) | (8u << (24 - 8 * chn))); goto fin; }   /* NOREP on other ports */
     if (cmd == 0x00 || cmd == 0xFF) { out[0] = 0x09; out[1] = 0x00; out[2] = 0x00; n = 3; }
     else if (cmd == 0x41 || cmd == 0x42) { u8 o[10] = {0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x1F, 0x1F, 0, 0}; memcpy(out, o, 10); n = 10; }
-    else if (cmd == 0x40) { u32 h = g_pad_hi, l = g_pad_lo; u8 o[8] = {h >> 24, h >> 16, h >> 8, h, l >> 24, l >> 16, l >> 8, l}; memcpy(out, o, 8); n = 8; }
+    else if (cmd == 0x40) { u32 h = pad_hi(), l = pad_lo(); u8 o[8] = {h >> 24, h >> 16, h >> 8, h, l >> 24, l >> 16, l >> 8, l}; memcpy(out, o, 8); n = 8; }
     for (int i = 0; i < n; i += 2) R16REG(0x6480 + i) = (u16)(out[i] << 8 | (i + 1 < n ? out[i + 1] : 0));
 fin:
     g_si_done_at = host_tb() + 40500000ull / 2000;   /* ~0.5 ms per transfer */
@@ -444,8 +449,8 @@ u32 mmio_read(u32 a, int size) {
     if (off == 0x3000) { v = pi_intsr(); goto done; }
     if (off == 0x6800) { sram_init(); mc_init(); if (g_mc_on) w32reg(0x6800, r32reg(0x6800) | 0x1000u); }
     if (off == 0x5016) { v = 1; goto done; }    /* ARAM ready */
-    if (off == 0x6404) { static u64 nr, np; nr++; if (g_pad_hi >> 24) { if (np++ < 5) rt_log("pad read with buttons %08X (read #%llu)\n", g_pad_hi, (unsigned long long)nr); } v = g_pad_hi; w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); w32reg(0x6438, r32reg(0x6438) & ~0x20000000u); goto done; }
-    if (off == 0x6408) { v = g_pad_lo; goto done; }
+    if (off == 0x6404) { static u64 nr, np; nr++; if (g_pad_hi >> 24) { if (np++ < 5) rt_log("pad read with buttons %08X (read #%llu)\n", g_pad_hi, (unsigned long long)nr); } v = pad_hi(); w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); w32reg(0x6438, r32reg(0x6438) & ~0x20000000u); goto done; }
+    if (off == 0x6408) { v = pad_lo(); goto done; }
     if (off == 0x6410 || off == 0x641C || off == 0x6428) { v = 0x80000000u; w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); goto done; }   /* ports 2-4: no controller */
     if (off == 0x5004 && size == 2) { v = g_dsp_out_n ? (0x8000 | (g_dsp_out[0] >> 16)) : 0; goto done; }
     if (off == 0x5006 && size == 2) { v = g_dsp_out_n ? (g_dsp_out[0] & 0xFFFF) : 0; if (g_dsp_out_n) { memmove(g_dsp_out, g_dsp_out + 1, --g_dsp_out_n * 4); } goto done; }
