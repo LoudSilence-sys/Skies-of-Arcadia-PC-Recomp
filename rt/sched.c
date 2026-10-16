@@ -87,6 +87,7 @@ WEAK void platform_pump(void) {
             if (!strcmp(btn, "start")) b0 |= 0x10; else if (!strcmp(btn, "a")) b0 |= 1; else if (!strcmp(btn, "b")) b0 |= 2;
             else if (!strcmp(btn, "x")) b0 |= 4; else if (!strcmp(btn, "y")) b0 |= 8;
             else if (!strcmp(btn, "up")) sy = 0xE0; else if (!strcmp(btn, "down")) sy = 0x20; else if (!strcmp(btn, "left")) sx = 0x20; else if (!strcmp(btn, "right")) sx = 0xE0;
+            else if (!strcmp(btn, "dleft")) b1 |= 0x01; else if (!strcmp(btn, "dright")) b1 |= 0x02; else if (!strcmp(btn, "ddown")) b1 |= 0x04; else if (!strcmp(btn, "dup")) b1 |= 0x08;
         }
     }
     si_set_pad(b0 << 24 | b1 << 16 | sx << 8 | sy, 0x80800000u);
@@ -104,6 +105,7 @@ void rt_poll(Ctx* c) {
         g_frames++;
         { extern void platform_pump(void); platform_pump(); }
         vi_retrace_event();
+        { extern int vi_refresh_hz(void); static int hz = 50; int nh = vi_refresh_hz(); if (nh != hz) { hz = nh; g_vi_period = TB_RATE / hz; rt_log("VI: %d Hz\n", hz); } }
     }
     hw_tick();
     deliver(c);
@@ -118,7 +120,7 @@ void rt_idle(Ctx* c) {
     if ((s64)(next - now) > 0) {
         u64 us = (next - now) * 1000000ull / TB_RATE;
         if (us > 20000) us = 20000;
-        usleep((useconds_t)us);
+        { extern u64 g_pf_idle; u64 t0 = host_tb(); usleep((useconds_t)us); g_pf_idle += host_tb() - t0; }
     }
     rt_poll(c);
 }

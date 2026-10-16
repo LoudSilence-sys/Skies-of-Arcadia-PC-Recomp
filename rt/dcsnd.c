@@ -18,6 +18,18 @@
 #include "ht/sega.h"
 #include "ht/dcsound.h"
 #include "ht/yam.h"
+#include <pthread.h>
+#include <unistd.h>
+
+/* The emulated chips run on their own thread, rendering ahead into a ring buffer at 44.1 kHz; the game
+   thread only resamples from it. One mutex guards all chip/port state (the game's sound calls and the
+   worker); the ring itself is single-producer/single-consumer with atomic positions. */
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK() pthread_mutex_lock(&g_mx)
+#define UNLOCK() pthread_mutex_unlock(&g_mx)
+#define RING 16384
+static float g_ring[2 * RING]; static volatile u64 g_rw, g_rr;
+static void start_worker(void);
 
 void rt_log(const char* fmt, ...);
 u64 host_tb(void);
@@ -209,6 +221,7 @@ static int dcsnd_init(void) {
     for (int i = 1; i < NINST; i++) { g_inst[i] = g_inst[0]; g_inst[i].st = malloc(sz); memcpy(g_inst[i].st, in->st, sz); g_inst[i].dc = sega_get_dcsound_state(g_inst[i].st); }
     in->used = 1;
     rt_log("dcsnd: Dreamcast sound driver running (%s), %d bank folders\n", g_roots[0], g_nroots);
+    start_worker();
     return 1;
 }
 
@@ -292,29 +305,55 @@ static void port_poll(Inst* in, u64 now) {
     }
 }
 
-/* mixing: called with each AI DMA block (stereo, host order L,R) */
-void dcsnd_mix(s16* buf, u32 frames, int rate) {
-    { static const char* t; static int init; if (!init) { init = 1; t = getenv("SOA_DCTEST"); if (t) { g_on = dcsnd_init(); } }
-      if (t && g_on) { static u64 t0; if (!t0) t0 = host_tb(); if (host_tb() - t0 > TB_RATE * 3) { char nm[16]; int sg = 0, k = 0; while (t[k] && t[k] != ':' && k < 15) { nm[k] = t[k]; k++; } nm[k] = 0; if (t[k] == ':') sg = atoi(t + k + 1); u32 id = dc_play_name(2, nm, sg); rt_log("dcsnd: test play %s #%d -> %08X\n", nm, sg, id); t = 0; } } }
-    if (!g_on || !frames || rate <= 0) return;
-    static double frac; static float carry[2];
+/* worker: render n chip frames (44.1 kHz) of all active instances into the ring */
+static void produce(u32 n) {
     static s16 tmp[2 * 4200]; static float acc[2 * 4200];
-    double step = 44100.0 / rate;
-    u32 m = (u32)floor(frac + (frames - 1) * step) + 1; if (m > 4100) m = 4100;
-    memset(acc, 0, sizeof(float) * 2 * (m + 1));
-    acc[0] = carry[0]; acc[1] = carry[1];
+    memset(acc, 0, sizeof(float) * 2 * n);
     u64 now = host_tb();
     for (int i = 0; i < NINST; i++) {
         Inst* in = &g_inst[i]; if (!in->used) continue;
         port_poll(in, now);
         { static int noskip = -1; if (noskip < 0) noskip = getenv("SOA_DCNOSKIP") != 0; if (!noskip && (s64)(now - in->last_active) > (s64)(TB_RATE * 4) && !in->nq) continue; }   /* idle: skip (reverb tail has decayed) */
         flush_cmds(in);
-        run(in, tmp, m);
-        { static FILE* df; static int dinit; if (!dinit) { dinit = 1; const char* e = getenv("SOA_DCDUMP"); if (e) df = fopen(e, "wb"); } if (df && i == 0) fwrite(tmp, 4, m, df); }
-        if (g_log) { static u64 dt; static int mx; for (u32 k = 0; k < 2 * m; k++) { int v = tmp[k] < 0 ? -tmp[k] : tmp[k]; if (v > mx) mx = v; } if (now - dt > TB_RATE * 2) { rt_log("dcsnd: inst %d raw peak %d m %u seq %08X\n", i, mx, m, r32(in, 0x11000 + 0x10)); mx = 0; dt = now; } }
-        for (u32 k = 0; k < m; k++) { acc[2 * (k + 1)] += tmp[2 * k]; acc[2 * (k + 1) + 1] += tmp[2 * k + 1]; }
+        run(in, tmp, n);
+        { static FILE* df; static int dinit; if (!dinit) { dinit = 1; const char* e = getenv("SOA_DCDUMP"); if (e) df = fopen(e, "wb"); } if (df && i == 0) fwrite(tmp, 4, n, df); }
+        if (g_log) { static u64 dt; static int mx; for (u32 k = 0; k < 2 * n; k++) { int v = tmp[k] < 0 ? -tmp[k] : tmp[k]; if (v > mx) mx = v; } if (now - dt > TB_RATE * 2) { rt_log("dcsnd: inst %d raw peak %d n %u seq %08X\n", i, mx, n, r32(in, 0x11000 + 0x10)); mx = 0; dt = now; } }
+        for (u32 k = 0; k < 2 * n; k++) acc[k] += tmp[k];
     }
+    u64 w = __atomic_load_n(&g_rw, __ATOMIC_RELAXED);
+    for (u32 k = 0; k < n; k++) { u32 o = (u32)((w + k) % RING); g_ring[2 * o] = acc[2 * k]; g_ring[2 * o + 1] = acc[2 * k + 1]; }
+    __atomic_store_n(&g_rw, w + n, __ATOMIC_RELEASE);
+}
+static void* worker(void* arg) {
+    (void)arg;
+    for (;;) {
+        u64 ahead = __atomic_load_n(&g_rw, __ATOMIC_ACQUIRE) - __atomic_load_n(&g_rr, __ATOMIC_ACQUIRE);
+        if (ahead < 2205) { LOCK(); produce(441); UNLOCK(); }   /* keep ~50 ms rendered ahead, in 10 ms steps */
+        else usleep(2000);
+    }
+    return 0;
+}
+static void start_worker(void) {
+    pthread_t t; if (pthread_create(&t, 0, worker, 0)) { rt_log("dcsnd: no worker thread\n"); return; }
+    pthread_detach(t);
+}
+static u32 dc_play_name(int s, const char* name, int song);
+/* mixing: called with each AI DMA block (stereo, host order L,R) on the game thread; resamples from the ring */
+void dcsnd_mix(s16* buf, u32 frames, int rate) {
+    { static const char* t; static int init; if (!init) { init = 1; t = getenv("SOA_DCTEST"); if (t) { LOCK(); g_on = dcsnd_init(); UNLOCK(); } }
+      if (t && g_on) { static u64 t0; if (!t0) t0 = host_tb(); if (host_tb() - t0 > TB_RATE * 3) { char nm[16]; int sg = 0, k = 0; while (t[k] && t[k] != ':' && k < 15) { nm[k] = t[k]; k++; } nm[k] = 0; if (t[k] == ':') sg = atoi(t + k + 1); LOCK(); u32 id = dc_play_name(2, nm, sg); UNLOCK(); rt_log("dcsnd: test play %s #%d -> %08X\n", nm, sg, id); t = 0; } } }
+    if (!g_on || !frames || rate <= 0) return;
+    static double frac; static float prev[2];
+    double step = 44100.0 / rate;
+    u32 m = (u32)floor(frac + (frames - 1) * step) + 1; if (m > 4100) m = 4100;
+    static float acc[2 * 4200];
+    u64 r = __atomic_load_n(&g_rr, __ATOMIC_RELAXED), w = __atomic_load_n(&g_rw, __ATOMIC_ACQUIRE);
+    u32 have = (u32)(w - r > m ? m : w - r);
+    acc[0] = prev[0]; acc[1] = prev[1];
+    for (u32 k = 0; k < m; k++) { if (k < have) { u32 o = (u32)((r + k) % RING); acc[2 * (k + 1)] = g_ring[2 * o]; acc[2 * (k + 1) + 1] = g_ring[2 * o + 1]; } else acc[2 * (k + 1)] = acc[2 * (k + 1) + 1] = 0; }
+    __atomic_store_n(&g_rr, r + have, __ATOMIC_RELEASE);
     static float dcb_x[2], dcb_y[2]; static double lvl; static u32 lvl_n; static u64 lvl_t;
+    u64 now = host_tb();
     for (u32 o = 0; o < frames; o++) {
         double t = frac + o * step; u32 k = (u32)t; float f = (float)(t - k);
         if (k + 1 > m) k = m - 1;
@@ -326,28 +365,34 @@ void dcsnd_mix(s16* buf, u32 frames, int rate) {
             buf[2 * o + c] = (s16)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
         }
     }
-    if (g_log && now - lvl_t > TB_RATE * 2) { rt_log("dcsnd: t=%llus level %.1f dB\n", (unsigned long long)(now / TB_RATE), 10 * log10(lvl / (lvl_n ? lvl_n : 1) + 1)); lvl = 0; lvl_n = 0; lvl_t = now; }
+    if (g_log && now - lvl_t > TB_RATE * 2) { rt_log("dcsnd: t=%llus level %.1f dB ring %llu\n", (unsigned long long)(now / TB_RATE), 10 * log10(lvl / (lvl_n ? lvl_n : 1) + 1), (unsigned long long)(w - r)); lvl = 0; lvl_n = 0; lvl_t = now; }
     frac = frac + frames * step - m; if (frac < 0) frac = 0;
-    carry[0] = acc[2 * m]; carry[1] = acc[2 * m + 1];
+    prev[0] = acc[2 * m]; prev[1] = acc[2 * m + 1];
 }
 
 /* ---------------- MusyX overrides ---------------- */
 void r_8027E6F8(Ctx*); void r_802703C0(Ctx*); void r_802704D0(Ctx*); void r_80270388(Ctx*); void r_80270440(Ctx*);
 void r_80270358(Ctx*); void r_80270610(Ctx*); void r_80270538(Ctx*);
 
-void f_8027E6F8(Ctx* c) {   /* sndSeqPlayEx(groupId, songId, arrfile, params, studio) */
+static void dc_8027E6F8(Ctx* c);
+void f_8027E6F8(Ctx* c) { LOCK(); dc_8027E6F8(c); UNLOCK(); }
+static void dc_8027E6F8(Ctx* c) {   /* sndSeqPlayEx(groupId, songId, arrfile, params, studio) */
     u32 id = dc_play(c->r[3] & 0xFFFF, c->r[4] & 0xFFFF);
     if (id != 0xFFFFFFFFu) { c->r[3] = id; return; }
     r_8027E6F8(c);
 }
-void f_802703C0(Ctx* c) {   /* sndSeqStop(seqId) */
+static void dc_802703C0(Ctx* c);
+void f_802703C0(Ctx* c) { LOCK(); dc_802703C0(c); UNLOCK(); }
+static void dc_802703C0(Ctx* c) {   /* sndSeqStop(seqId) */
     u32 id = c->r[3];
     if (!is_dc_id(id)) { r_802703C0(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt);
     if (g_log) rt_log("dcsnd: t=%llus stop %08X\n", (unsigned long long)(host_tb() / TB_RATE), id);
     if (pt) { cmd(in, 0x02, 0, id & 7, 0, 0, 0); pt->busy = pt->pending = pt->paused = 0; pt->fade_len = 0; pt->id = 0; }
 }
-void f_802704D0(Ctx* c) {   /* sndSeqVolume(vol, time ms, seqId, mode) */
+static void dc_802704D0(Ctx* c);
+void f_802704D0(Ctx* c) { LOCK(); dc_802704D0(c); UNLOCK(); }
+static void dc_802704D0(Ctx* c) {   /* sndSeqVolume(vol, time ms, seqId, mode) */
     u32 id = c->r[5];
     if (!is_dc_id(id)) { r_802704D0(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt); if (!pt) return;
@@ -359,7 +404,9 @@ void f_802704D0(Ctx* c) {   /* sndSeqVolume(vol, time ms, seqId, mode) */
     } else { pt->fade_from = pt->vol; pt->fade_to = vol; pt->fade_t = 0; pt->fade_len = ms / 5; pt->fade_mode = mode; }
     if (g_log) rt_log("dcsnd: t=%llus volume %08X -> %d over %d ms (mode %d)\n", (unsigned long long)(host_tb() / TB_RATE), id, vol, ms, mode);
 }
-void f_80270388(Ctx* c) {   /* sndSeqPause */
+static void dc_80270388(Ctx* c);
+void f_80270388(Ctx* c) { LOCK(); dc_80270388(c); UNLOCK(); }
+static void dc_80270388(Ctx* c) {   /* sndSeqPause */
     u32 id = c->r[3];
     if (!is_dc_id(id)) { r_80270388(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt);
@@ -367,7 +414,9 @@ void f_80270388(Ctx* c) {   /* sndSeqPause */
     if (!pt || pt->paused) return;
     cmd(in, 0x03, 0, id & 7, 0, 0, 0); pt->paused = 1;
 }
-void f_80270440(Ctx* c) {   /* sndSeqContinue */
+static void dc_80270440(Ctx* c);
+void f_80270440(Ctx* c) { LOCK(); dc_80270440(c); UNLOCK(); }
+static void dc_80270440(Ctx* c) {   /* sndSeqContinue */
     u32 id = c->r[3];
     if (!is_dc_id(id)) { r_80270440(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt);
@@ -375,13 +424,17 @@ void f_80270440(Ctx* c) {   /* sndSeqContinue */
     if (!pt || !pt->paused) return;
     cmd(in, 0x04, 0, id & 7, 0, 0, 0); pt->paused = 0; in->last_active = host_tb();
 }
-void f_80270358(Ctx* c) {   /* sndSeqGetValid -> bool */
+static void dc_80270358(Ctx* c);
+void f_80270358(Ctx* c) { LOCK(); dc_80270358(c); UNLOCK(); }
+static void dc_80270358(Ctx* c) {   /* sndSeqGetValid -> bool */
     u32 id = c->r[3];
     if (!is_dc_id(id)) { r_80270358(c); return; }
     Port* pt; id_inst(id, &pt);
     c->r[3] = pt && (pt->busy || pt->pending || pt->paused) ? 1 : 0;
 }
-void f_80270610(Ctx* c) {   /* sndSilence: stop everything */
+static void dc_80270610(Ctx* c);
+void f_80270610(Ctx* c) { LOCK(); dc_80270610(c); UNLOCK(); }
+static void dc_80270610(Ctx* c) {   /* sndSilence: stop everything */
     if (g_log) rt_log("dcsnd: t=%llus silence all\n", (unsigned long long)(host_tb() / TB_RATE));
     r_80270610(c);
     for (int i = 0; i < NINST; i++) for (int p = 0; p < NPORT; p++) {
@@ -389,7 +442,9 @@ void f_80270610(Ctx* c) {   /* sndSilence: stop everything */
         cmd(&g_inst[i], 0x02, 0, p, 1, 0, 0); memset(pt, 0, sizeof *pt);
     }
 }
-void f_80270538(Ctx* c) {   /* sndSeqSendMidiCtrl(seqId, channel, ctrl, value) -> bool */
+static void dc_80270538(Ctx* c);
+void f_80270538(Ctx* c) { LOCK(); dc_80270538(c); UNLOCK(); }
+static void dc_80270538(Ctx* c) {   /* sndSeqSendMidiCtrl(seqId, channel, ctrl, value) -> bool */
     u32 id = c->r[3];
     if (!is_dc_id(id)) { r_80270538(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt);
@@ -402,7 +457,9 @@ void f_80270538(Ctx* c) {   /* sndSeqSendMidiCtrl(seqId, channel, ctrl, value) -
     c->r[3] = 1;
 }
 void r_802706A4(Ctx*);
-void f_802706A4(Ctx* c) {   /* sndOutputMode(0 = mono, 1 = stereo, 2 = surround): AICA MONO bit (reg 0x2800 bit 15) */
+static void dc_802706A4(Ctx* c);
+void f_802706A4(Ctx* c) { LOCK(); dc_802706A4(c); UNLOCK(); }
+static void dc_802706A4(Ctx* c) {   /* sndOutputMode(0 = mono, 1 = stereo, 2 = surround): AICA MONO bit (reg 0x2800 bit 15) */
     int mono = (c->r[3] & 0xFF) == 0;
     r_802706A4(c);
     if (!g_tried) g_on = dcsnd_init();

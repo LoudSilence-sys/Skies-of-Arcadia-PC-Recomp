@@ -20,6 +20,8 @@ static u32 bp[256];
 static u32 xf_mem[0x1000];         /* 0x0000-0x0FFF: matrices, normals, post, lights */
 static u32 xf_reg[0x100];          /* 0x1000-0x10FF */
 static u8 tmem[1 << 20];
+u64 host_tb(void);
+u32 g_tex_epoch = 1;   /* see bind_tex: advances whenever texture memory may have changed */
 u64 g_tris; int g_exp = -1; u32 g_rej[3];   /* SOA_EXP debug knobs: 1 no culling, 2 no depth test */
 
 static float xff(u32 a) { u32 v = a < 0x1000 ? xf_mem[a] : xf_reg[a & 0xFF]; float f; memcpy(&f, &v, 4); return f; }
@@ -49,8 +51,9 @@ void gx_bp(u32 v) {
     if (bp[0xFE]) { u32 m = bp[0xFE]; val = (bp[r] & ~m) | (val & m); bp[0xFE] = 0; }
     bp[r] = val;
     if (r >= 0xE0 && r <= 0xE7) { extern u32 g_tevcol[2][8]; g_tevcol[(val >> 23) & 1][r - 0xE0] = val; }   /* TEV color registers and konst colors share these addresses */
-    if (r == 0x52) efb_copy(val);
-    if (r == 0x65) load_tlut();
+    if (r == 0x52) { efb_copy(val); g_tex_epoch++; }
+    if (r == 0x65) { load_tlut(); g_tex_epoch++; }
+    if (r == 0x63) g_tex_epoch++;
     if (r == 0x63 && val) {   /* TMEM preload (GXPreLoadEntireTexture), as Dolphin */
         u32 src = (bp[0x60] & 0xFFFFFF) << 5, ev = (bp[0x61] & 0xFFFFFF) << 5, od = (bp[0x62] & 0xFFFFFF) << 5, cnt = val & 0x7FFF, type = (val >> 15) & 3;
         if (type != 3) { for (u32 i = 0; i < cnt * 32 && ev + i < sizeof tmem; i++) tmem[ev + i] = g_ram[(src + i) & 0x01FFFFFF]; }
@@ -453,8 +456,13 @@ int gx_tex_info(int map, u32* key, u32* w, u32* h, u32* mode0, u32* nbytes, u32*
     key[0] = d.addr; key[1] = d.w | d.h << 16; key[2] = d.fmt | d.tlut_fmt << 4 | d.tlut_off << 8; key[3] = 0;
     if (d.tm) {   /* preloaded: key and hash come from TMEM */
         key[0] = 0xF0000000u | d.even; u32 n = *nbytes, hsh = 2166136261u;
-        for (u32 i = 0; i < n; i += 4) { hsh ^= tmem[(d.even + i) & 0xFFFFF]; hsh *= 16777619u; }
-        if (d.fmt == 6) for (u32 i = 0; i < n / 2; i += 4) { hsh ^= tmem[(d.odd + i) & 0xFFFFF]; hsh *= 16777619u; }
+        static u32 ce, cn, cf, cepoch, ch;
+        if (cepoch == g_tex_epoch && ce == d.even && cn == n && cf == d.fmt) hsh = ch;
+        else {
+            for (u32 i = 0; i < n; i += 4) { hsh ^= tmem[(d.even + i) & 0xFFFFF]; hsh *= 16777619u; }
+            if (d.fmt == 6) for (u32 i = 0; i < n / 2; i += 4) { hsh ^= tmem[(d.odd + i) & 0xFFFFF]; hsh *= 16777619u; }
+            ce = d.even; cn = n; cf = d.fmt; cepoch = g_tex_epoch; ch = hsh;
+        }
         key[3] = hsh; *nbytes = 0;
     }
     if (d.fmt == 8 || d.fmt == 9 || d.fmt == 10) {
@@ -711,8 +719,23 @@ static void efb_copy(u32 v) {
     int sx = tl & 0x3FF, sy = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
     u32 dst = (bp[0x4B] & 0xFFFFFF) << 5; u32 stride = (bp[0x4D] & 0x3FF) << 5;
     int to_xfb = (v >> 14) & 1, clear = (v >> 11) & 1, half = (v >> 9) & 1;
-    if (g_use_gl) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb(efb_c, sx, sy, rw, rh); }
-    if (to_xfb) {
+    extern int g_dump_every; extern int g_dbgf;
+    extern int g_frame_no_pub;
+    int need_xfb_pixels = (g_dump_every && (g_frame_no_pub + 1) % g_dump_every == 0) || g_dbgf || !g_use_gl;   /* GL presents the EFB directly; the XFB in RAM is only for dumps */
+    int tpf0 = (v >> 3) & 15, fmt0 = tpf0 / 2 + (tpf0 & 1) * 8;
+    int gpu_copy = 0;
+    if (g_use_gl && !to_xfb && (bp[0x43] & 7) != 3 && !g_dbgf) {   /* texture copy kept on the GPU (not depth) */
+        extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes);
+        int tw = half ? w / 2 : w, th = half ? h / 2 : h; int bpp = (fmt0 == 0) ? 4 : (fmt0 == 2 || fmt0 == 7 || fmt0 == 8 || fmt0 == 1 || fmt0 == 9 || fmt0 == 10) ? 8 : (fmt0 == 6) ? 32 : 16;
+        int bw = bpp == 4 ? 8 : bpp == 8 ? 8 : 4, bh = bpp == 4 ? 8 : 4; u32 nb = (u32)((tw + bw - 1) / bw) * ((th + bh - 1) / bh) * (bpp == 32 ? 64 : 32);
+        gpu_copy = gl_efb_copy_tex(sx, sy, w, h, half, fmt0, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb);
+    }
+    if (g_use_gl && !gpu_copy && (!to_xfb || need_xfb_pixels)) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb(efb_c, sx, sy, rw, rh); }
+    if (to_xfb && !need_xfb_pixels) {
+        g_xfb_ready = 1; g_xfb_addr = dst;
+        extern void gx_frame_done(int w, int h);
+        gx_frame_done(w, h);
+    } else if (to_xfb) {
         /* write YUYV into RAM so VI-based code and screenshots see it */
         for (int y = 0; y < h; y++) for (int x = 0; x + 1 < w; x += 2) {
             u32 c0 = efb_c[(sy + y) * EFB_W + sx + x], c1 = efb_c[(sy + y) * EFB_W + sx + x + 1];
@@ -727,7 +750,7 @@ static void efb_copy(u32 v) {
         g_xfb_ready = 1; g_xfb_addr = dst;
         extern void gx_frame_done(int w, int h);
         gx_frame_done(w, h);
-    } else {
+    } else if (!gpu_copy) {
         /* texture copy (formats per Dolphin's EFBCopyFormat; layout = GX texture block layout) */
         int tpf = (v >> 3) & 15; int fmt = tpf / 2 + (tpf & 1) * 8; int inten = (v >> 15) & 1;
         int noalpha = (bp[0x43] & 7) != 1;
@@ -790,11 +813,27 @@ void gx_dump_efb(const char* path, int w, int h) {
     fclose(f);
 }
 static int g_frame_no; int g_frame_no_pub; int g_dbgf;
+#ifdef _WIN32
+int g_dump_every = 0;    /* SOA_DUMP=N: write every Nth frame to frames/ */
+#else
 int g_dump_every = 25;
-static void dbg_init(void) { static int d; if (!d) { d = 1; const char* e = getenv("SOA_DBGFRAME"); if (e) g_dbgf = atoi(e); } }
+#endif
+static void dbg_init(void) { static int d; if (!d) { d = 1; const char* e = getenv("SOA_DBGFRAME"); if (e) g_dbgf = atoi(e); e = getenv("SOA_DUMP"); if (e) g_dump_every = atoi(e); } }
 WEAK void platform_present(void) { }
 void gx_frame_done(int w, int h) {
-    if (g_use_gl) platform_present();
+    g_tex_epoch++;
+    { extern u64 g_pf_present; u64 t = host_tb(); if (g_use_gl) platform_present(); g_pf_present += host_tb() - t; }
+    {   /* every ~5 s: frame rate and where the host time went (ms per frame) */
+        extern u64 g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle; static u64 t0, n;
+        u64 now = host_tb(); n++;
+        if (!t0) t0 = now;
+        else if (now - t0 > 5ull * 40500000ull) {
+            double ms = 1000.0 / 40500000.0 / n;
+            rt_log("perf: %.1f fps | per frame ms: flush %.2f (hash %.2f, upload %.2f) readback %.2f present %.2f dc-sound %.2f idle %.2f | draws %.0f\n", n * 40500000.0 / (now - t0),
+                   g_pf_flush * ms, g_pf_hash * ms, g_pf_upload * ms, g_pf_read * ms, g_pf_present * ms, g_pf_snd * ms, g_pf_idle * ms, (double)g_pf_draws / n);
+            t0 = now; n = 0; g_pf_hash = g_pf_flush = g_pf_read = g_pf_present = g_pf_draws = g_pf_upload = g_pf_snd = g_pf_idle = 0;
+        }
+    }
     dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
     { static int armed = 1; if (armed && getenv("SOA_REDDBG")) { double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         if (m[0] > 2 * m[1] + 4800 * 10 && m[0] > 60 * 4800) { armed = 0; g_dbgf = g_frame_no + 1; rt_log("red frame %d detected, tracing next\n", g_frame_no); gx_dump_efb("frames/red_before.ppm", 640, 480); } } }

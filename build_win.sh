@@ -12,5 +12,5 @@ $CC -c rt/dolblob.S -o build_win/dolblob.o
 HTDEF="-DEMU_COMPILE -DEMU_LITTLE_ENDIAN -DHAVE_STDINT_H -DUSE_M68K -DLSB_FIRST"
 for f in rt/ht/*.c rt/ht/m68k/*.c; do o=build_win/ht_$(basename $f .c).o; [ $o -nt $f ] || $CC -O2 -w $HTDEF -c $f -o $o; done
 for f in rt/*.c; do $CC -O2 -Wall -Wno-unused -Iout -c $f -o build_win/$(basename $f .c).o; done
-$CC -o SkiesOfArcadia.exe build_win/*.o -lopengl32 -lgdi32 -luser32 -lwinmm -static
+$CC -o SkiesOfArcadia.exe build_win/*.o -lopengl32 -lgdi32 -luser32 -lwinmm -lpthread -static
 echo built-win

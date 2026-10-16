@@ -13,6 +13,21 @@ static HWND g_hwnd; static HDC g_hdc; static HGLRC g_glrc;
 static int g_win_w = 1280, g_win_h = 960;
 static HMODULE g_opengl32;
 static u8 g_keys[256];
+int settings_get(const char* key, int def);
+static int g_fullscreen; static RECT g_saved_rect;
+static void set_fullscreen(int on) {   /* borderless fullscreen on the window's monitor */
+    if (on == g_fullscreen) return;
+    if (on) {
+        GetWindowRect(g_hwnd, &g_saved_rect);
+        MONITORINFO mi = {sizeof mi}; GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongA(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongA(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(g_hwnd, 0, g_saved_rect.left, g_saved_rect.top, g_saved_rect.right - g_saved_rect.left, g_saved_rect.bottom - g_saved_rect.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
+    g_fullscreen = on;
+}
 
 static void* win_getproc(const char* n) {
     void* p = (void*)wglGetProcAddress(n);
@@ -24,7 +39,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CLOSE: ExitProcess(0); return 0;
     case WM_SIZE: g_win_w = LOWORD(l); g_win_h = HIWORD(l); return 0;
-    case WM_KEYDOWN: case WM_SYSKEYDOWN: g_keys[w & 255] = 1; if (w == VK_F11) { /* reserved */ } return 0;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        if (w == VK_F11 || (w == VK_RETURN && (l & (1 << 29)))) { if (!(l & (1 << 30))) set_fullscreen(!g_fullscreen); return 0; }   /* F11 / Alt+Enter */
+        g_keys[w & 255] = 1; return 0;
     case WM_KEYUP: case WM_SYSKEYUP: g_keys[w & 255] = 0; return 0;
     case WM_KILLFOCUS: memset(g_keys, 0, sizeof g_keys); return 0;
     }
@@ -34,6 +51,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 typedef HGLRC (WINAPI* PFNCREATECTX)(HDC, HGLRC, const int*);
 int platform_init(void) {
     HINSTANCE inst = GetModuleHandleA(0);
+    g_win_w = settings_get("window_width", 1280); g_win_h = settings_get("window_height", 960);
+    if (g_win_w < 320) g_win_w = 320; if (g_win_h < 240) g_win_h = 240;
     WNDCLASSA wc = {0}; wc.style = CS_OWNDC; wc.lpfnWndProc = wndproc; wc.hInstance = inst; wc.lpszClassName = "SoAWin";
     wc.hCursor = LoadCursor(0, IDC_ARROW);
     RegisterClassA(&wc);
@@ -52,8 +71,9 @@ int platform_init(void) {
     }
     if (!g_glrc) { MessageBoxA(0, "Your graphics driver does not support OpenGL 3.3.", "Skies of Arcadia", MB_OK); return 0; }
     wglMakeCurrent(g_hdc, g_glrc); wglDeleteContext(tmp);
-    typedef BOOL (WINAPI* PFNSWAP)(int); PFNSWAP swap = (PFNSWAP)wglGetProcAddress("wglSwapIntervalEXT"); if (swap) swap(0);
+    typedef BOOL (WINAPI* PFNSWAP)(int); PFNSWAP swap = (PFNSWAP)wglGetProcAddress("wglSwapIntervalEXT"); if (swap) swap(settings_get("vsync", 0) ? 1 : 0);
     g_opengl32 = LoadLibraryA("opengl32.dll");
+    if (settings_get("fullscreen", 0)) set_fullscreen(1);
     return gl_load(win_getproc);
 }
 

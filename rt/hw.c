@@ -104,6 +104,7 @@ u64 host_tb(void);
 static int g_di_pending; static u64 g_di_done_at;
 static void di_complete(void) { w32reg(0x601C, r32reg(0x601C) & ~1u); w32reg(0x6000, r32reg(0x6000) | 0x10); }
 static void di_exec(void) {
+    { extern u32 g_tex_epoch; g_tex_epoch++; }
     u32 cmd = r32reg(0x6008), a1 = r32reg(0x600C), a2 = r32reg(0x6010);
     u32 mar = r32reg(0x6014), len = r32reg(0x6018);
     u32 op = cmd >> 24;
@@ -128,6 +129,8 @@ static void di_exec(void) {
 }
 
 /* ======================= VI ======================= */
+/* field rate from the VI vertical timing register: ~287 active lines per field = 50 Hz PAL, ~240 = 60 Hz (NTSC/EuRGB60) */
+int vi_refresh_hz(void) { u32 acv = (R16REG(0x2000) >> 4) & 0x3FF; return acv == 0 ? 50 : acv > 260 ? 50 : 60; }
 void vi_retrace_event(void) {
     { u32 en = (r32reg(0x6430) >> 4) & 0xF;   /* EN0 = bit 7 ... EN3 = bit 4 */
       if (en) {
@@ -154,6 +157,7 @@ static void sram_init(void) {
     static int done; if (done) return; done = 1;
     memset(g_sram, 0, 64);
     g_sram[0x12] = 0;  g_sram[0x13] = 0x2C;
+    { extern int settings_get(const char*, int); if (settings_get("pal60", 1)) g_sram[0x11] |= 0x40; }   /* NTD bit 6: EuRGB60 (60 Hz) available, the game then offers 60 Hz */
     u16 c = 0, ci = 0;
     for (int i = 12; i < 20; i += 2) { u16 w = (u16)(g_sram[i] << 8 | g_sram[i + 1]); c += w; ci += (u16)~w; }
     g_sram[0] = c >> 8; g_sram[1] = (u8)c; g_sram[2] = ci >> 8; g_sram[3] = (u8)ci;
@@ -174,14 +178,43 @@ static void mc_flash_id_from_header(void) {
     }
     g_sram[0x3A] = sum ^ 0xFF;
 }
+/* GameCube card checksums: sum of 16-bit words and of their complements (0xFFFF -> 0) */
+static void mc_csum(const u8* p, u32 n, u8* out) {
+    u32 a = 0, b = 0;
+    for (u32 i = 0; i + 1 < n; i += 2) { u32 w = (u32)p[i] << 8 | p[i + 1]; a = (a + w) & 0xFFFF; b = (b + (w ^ 0xFFFF)) & 0xFFFF; }
+    if (a == 0xFFFF) a = 0; if (b == 0xFFFF) b = 0;
+    out[0] = a >> 8; out[1] = (u8)a; out[2] = b >> 8; out[3] = (u8)b;
+}
+/* write a freshly formatted, empty card (as CARDFormat / tools/mkcard.py): header, two directories, two BATs */
+static void mc_format_blank(u8* c, u32 size) {
+    u32 nblk = size / 0x2000, mb = size / 0x20000;
+    memset(c, 0xFF, size);
+    memset(c, 0, 0x200);
+    u64 t = host_tb() & 0xFFFFFFFFFFFFull, rnd = t;
+    for (int i = 0; i < 12; i++) {   /* serial = flash ID 0 + LCG, as CARDFormat */
+        rnd = ((rnd * 0x41C64E6Dull + 0x3039) >> 16); c[i] = (u8)rnd;
+        rnd = ((rnd * 0x41C64E6Dull + 0x3039) >> 16) & 0x7FFF;
+    }
+    for (int i = 0; i < 8; i++) c[12 + i] = (u8)(t >> (56 - 8 * i));
+    c[0x22] = (u8)(mb >> 8); c[0x23] = (u8)mb;   /* size in Mbit; encoding 0 = ANSI */
+    memset(c + 0x26, 0xFF, 0x1FC - 0x26);
+    mc_csum(c, 0x1FC, c + 0x1FC);
+    for (int d = 1; d <= 2; d++) { u8* p = c + d * 0x2000; p[0x1FFA] = 0; p[0x1FFB] = (u8)(d - 1); mc_csum(p, 0x1FFC, p + 0x1FFC); }
+    for (int d = 3; d <= 4; d++) {
+        u8* p = c + d * 0x2000; memset(p, 0, 0x2000);
+        p[5] = (u8)(d - 3); u32 fr = nblk - 5; p[6] = (u8)(fr >> 8); p[7] = (u8)fr; p[8] = 0; p[9] = 4;
+        mc_csum(p + 4, 0x2000 - 4, p);
+    }
+}
 static void mc_init(void) {
     static int done; if (done) return; done = 1;
     const char* path = getenv("SOA_CARD"); if (!path) path = "MemoryCardA.raw";
     g_mc_f = fopen(path, "r+b");
-    if (!g_mc_f) {   /* new blank 251-block card; the game offers to format it */
+    if (!g_mc_f) {   /* new 251-block card, created already formatted (as Dolphin does) */
         g_mc_f = fopen(path, "w+b");
         if (!g_mc_f) { rt_log("memcard: cannot create %s\n", path); return; }
         g_mc_size = 0x10 * 0x20000; g_mc = calloc(1, g_mc_size);
+        mc_format_blank(g_mc, g_mc_size);
         fwrite(g_mc, 1, g_mc_size, g_mc_f); fflush(g_mc_f);
     } else {
         fseek(g_mc_f, 0, SEEK_END); long sz = ftell(g_mc_f); fseek(g_mc_f, 0, SEEK_SET);
@@ -204,7 +237,7 @@ static u8 mc_xfer(u8 b) {
     u32 p = g_mc_pos++; u8 out = 0xFF;
     switch (g_mc_cmd) {
     case 0x00: out = p == 1 ? 0x80 : (u8)(mc_card_id() >> (24 - ((p - 2) & 3) * 8)); break;   /* NintendoID */
-    case 0x83: if (p == 1) out = g_mc_status; break;                                       /* ReadStatus */
+    case 0x83: out = g_mc_status; break;   /* every byte after the command (as Dolphin) */                                     /* ReadStatus */
     case 0x85: out = p == 1 ? 0xC2 : p == 2 ? 0x21 : 0xFF; break;                             /* ReadID */
     case 0x81: if (p == 1) g_mc_irqsw = b; break;                                             /* SetInterrupt */
     case 0xF1:                                                                                /* SectorErase */
@@ -224,6 +257,7 @@ static u8 mc_xfer(u8 b) {
 static void mc_cmd_done_later(void) { g_mc_status |= 0x80; g_mc_status &= ~0x01; g_mc_done_pending = 1; g_mc_done_at = host_tb() + 40500000ull / 4000; }
 static void mc_deselect(void) {
     if (g_mc_pos == 0) return;
+    { static int lg = -1, n; if (lg < 0) lg = getenv("SOA_MCLOG") != 0; if (lg && n++ < 400) rt_log("mc cmd %02X len %u addr %06X status %02X irqsw %d\n", g_mc_cmd, g_mc_pos, g_mc_addr, g_mc_status, g_mc_irqsw); }
     if (g_mc_cmd == 0xF1 && g_mc_pos >= 3) {
         u32 a = (g_mc_addr % g_mc_size) & ~0x1FFFu; memset(g_mc + a, 0xFF, 0x2000); mc_flush(a, 0x2000); mc_cmd_done_later();
     } else if (g_mc_cmd == 0xF2 && g_mc_pos >= 5) {
@@ -399,7 +433,7 @@ static void aram_dma(void) {
     }
     /* completion after a realistic delay (~80 MB/s), with the DMA-busy bit set meanwhile */
     g_ar_done_at = host_tb() + 40500000ull * (len + 64) / 80000000ull + 40;
-    g_ar_pending = 1; R16REG(0x500A) |= 0x200;
+    g_ar_pending = 1; R16REG(0x500A) |= 0x200; { extern u32 g_tex_epoch; g_tex_epoch++; }
 }
 
 /* ======================= access dispatch ======================= */

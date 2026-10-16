@@ -204,6 +204,38 @@ static void on_sig(int sig) {
     _exit(2);
 }
 
+/* settings.ini next to the exe: "key = value" lines, '#' or ';' comments */
+static char g_set_k[64][48]; static int g_set_v[64]; static int g_set_n = -1;
+int settings_get(const char* key, int def) {
+    if (g_set_n < 0) {
+        g_set_n = 0; FILE* f = fopen("settings.ini", "r"); char line[256];
+        while (f && fgets(line, sizeof line, f) && g_set_n < 64) {
+            char k[48]; int v;
+            if (line[0] == '#' || line[0] == ';') continue;
+            if (sscanf(line, " %47[A-Za-z0-9_] = %d", k, &v) == 2) { strcpy(g_set_k[g_set_n], k); g_set_v[g_set_n++] = v; }
+        }
+        if (f) fclose(f);
+        else if ((f = fopen("settings.ini", "w"))) {   /* write defaults so the options are discoverable */
+            fputs("# Skies of Arcadia Legends (recompiled) settings\n"
+                  "# resolution_scale: internal rendering resolution, 1 = native 640x480, 2 = 1280x960, 3 = 1920x1440, 4 = 2560x1920 ...\n"
+                  "resolution_scale = 3\n"
+                  "# fullscreen: 1 = start in borderless fullscreen (F11 or Alt+Enter toggles in game)\n"
+                  "fullscreen = 0\n"
+                  "# vsync: 1 = sync presentation to the display\n"
+                  "vsync = 0\n"
+                  "# window size at startup\n"
+                  "window_width = 1280\n"
+                  "window_height = 960\n"
+                  "# pal60: 1 = let the game use its 60 Hz (EuRGB60) mode, 0 = 50 Hz PAL\n"
+                  "pal60 = 1\n", f);
+            fclose(f);
+        }
+    }
+    for (int i = 0; i < g_set_n; i++) if (!strcmp(g_set_k[i], key)) return g_set_v[i];
+    if (!strcmp(key, "resolution_scale")) return 3;
+    return def;
+}
+
 int main(int argc, char** argv) {
 #ifndef _WIN32
     if (getenv("SOA_PROF")) {
@@ -235,6 +267,11 @@ int main(int argc, char** argv) {
     setup_lowmem();
     load_fst(argv[1]);
     { extern void ax_load_coeffs(const char*); ax_load_coeffs("dsp_coef.bin"); }
+    { extern int g_scale; int sc = settings_get("resolution_scale", 3); if (getenv("SOA_SCALE")) sc = atoi(getenv("SOA_SCALE"));
+#ifndef _WIN32
+      if (!getenv("SOA_SCALE")) sc = 1;   /* headless test runs stay native */
+#endif
+      g_scale = sc < 1 ? 1 : sc > 8 ? 8 : sc; }
     { extern int g_use_gl; extern int gl_init(void); if (!getenv("SOA_SOFT")) { if (gl_init()) g_use_gl = 1; else rt_log("GL init failed: software renderer\n"); } }
     static Ctx c0; Ctx* c = &c0; g_ctx = c;
     c->msr = 0x00002032; c->hid0 = 0x0011C464; c->hid2 = 0xE0000000;

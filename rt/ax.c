@@ -298,7 +298,7 @@ int ai_dma_tick(int rate, u16* csr) {
         s16 r = (s16)(g_ram[a] << 8 | g_ram[a + 1]), l = (s16)(g_ram[a + 2] << 8 | g_ram[a + 3]);
         buf[2 * i] = l; buf[2 * i + 1] = r;
     }
-    { extern void dcsnd_mix(s16*, u32, int); dcsnd_mix(buf, frames, rate); }
+    { extern void dcsnd_mix(s16*, u32, int); extern u64 g_pf_snd; u64 t = host_tb(); dcsnd_mix(buf, frames, rate); g_pf_snd += host_tb() - t; }
     host_audio_write(buf, frames, rate);
     g_dma_next += (u64)frames * 40500000ull / rate;
     if ((s64)(now - g_dma_next) > 40500000 / 10) g_dma_next = now;   /* don't spiral after stalls */
