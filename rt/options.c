@@ -20,7 +20,8 @@ WEAK void platform_set_vsync(int on) { (void)on; }
 WEAK void dcsnd_set_enabled(int on) { (void)on; }
 void interp_set(int on);
 
-enum { O_RES, O_FULL, O_VSYNC, O_FPS60, O_HZ, O_DC, O_BACK, O_N };
+enum { O_RES, O_WIDE, O_FULL, O_VSYNC, O_FPS60, O_HZ, O_DC, O_BACK, O_N };
+void gl_set_widescreen(int on);
 static int g_open, g_sel, g_fade;   /* g_fade: frames since opening, for the fade-in */
 static int g_restart_note;
 static u32 g_prev;                  /* previous pad buttons, for edge detection */
@@ -33,6 +34,7 @@ void options_toggle(void) { if (g_open) options_close(); else options_open(); }
 static int val(int i) {
     switch (i) {
     case O_RES: return settings_get("resolution_scale", 3);
+    case O_WIDE: return settings_get("widescreen", 1);
     case O_FULL: return platform_get_fullscreen();
     case O_VSYNC: return settings_get("vsync", 0);
     case O_FPS60: return settings_get("fps60", 1);
@@ -45,6 +47,7 @@ static void change(int i, int dir) {
     int v = val(i);
     switch (i) {
     case O_RES: v += dir; if (v < 1) v = 6; if (v > 6) v = 1; settings_set("resolution_scale", v); gl_set_scale(v); break;
+    case O_WIDE: v = !v; settings_set("widescreen", v); gl_set_widescreen(v); break;
     case O_FULL: v = !v; settings_set("fullscreen", v); platform_set_fullscreen(v); break;
     case O_VSYNC: v = !v; settings_set("vsync", v); platform_set_vsync(v); break;
     case O_FPS60: v = !v; settings_set("fps60", v); interp_set(v); break;
@@ -85,13 +88,13 @@ void options_draw(float x, float y, float w, float h) {
     rect(0, 0, 640, 480, dim, dim);
     /* window: the game's translucent blue gradient with a light rim */
     float rim[4] = {0.62f, 0.78f, 1.f, 0.95f * a}, top[4] = {0.10f, 0.22f, 0.62f, 0.88f * a}, bot[4] = {0.03f, 0.08f, 0.32f, 0.88f * a};
-    float wx = 92, wy = 104, ww = 456, wh = 318;
+    float wx = 92, wy = 100, ww = 456, wh = 352;
     rect(wx - 3, wy - 3, ww + 6, wh + 6, rim, rim);
     float dark[4] = {0.02f, 0.05f, 0.20f, 0.95f * a};
     rect(wx - 1, wy - 1, ww + 2, wh + 2, dark, dark);
     rect(wx, wy, ww, wh, top, bot);
-    ui_title(X0 + (320 - 117) * K, Y0 + 62 * K, 234 * K, 60 * K, a);
-    static const char* names[O_N] = {"Resolution", "Fullscreen", "V-Sync", "60 FPS (interpolated)", "Refresh rate", "Sound", "Back"};
+    ui_title(X0 + (320 - 117) * K, Y0 + 58 * K, 234 * K, 60 * K, a);
+    static const char* names[O_N] = {"Resolution", "Widescreen (16:9)", "Fullscreen", "V-Sync", "60 FPS (interpolated)", "Refresh rate", "Sound", "Back"};
     float white[4] = {1, 1, 1, a}, gold[4] = {1.f, 0.90f, 0.35f, a}, grey[4] = {0.62f, 0.68f, 0.82f, a};
     for (int i = 0; i < O_N; i++) {
         float ry = wy + 22 + i * 38;
@@ -104,7 +107,7 @@ void options_draw(float x, float y, float w, float h) {
         text(wx + 40, ry, 22, names[i], white);
         char v[48]; int n = val(i);
         switch (i) {
-        case O_RES: snprintf(v, sizeof v, "%dx  %dx%d%s", n, 640 * n, 480 * n, n == 5 ? " (4K)" : ""); break;
+        case O_RES: { int ws = settings_get("widescreen", 1); snprintf(v, sizeof v, "%dx  %dx%d%s", n, ws ? 640 * n * 4 / 3 : 640 * n, 480 * n, n == 5 ? " (4K)" : ""); break; }
         case O_HZ: snprintf(v, sizeof v, "%s", n ? "60 Hz" : "50 Hz"); break;
         case O_DC: snprintf(v, sizeof v, "%s", n ? "Dreamcast" : "GameCube"); break;
         default: snprintf(v, sizeof v, "%s", n ? "On" : "Off"); break;

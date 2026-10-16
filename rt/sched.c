@@ -120,10 +120,20 @@ void rt_idle(Ctx* c) {
     u64 now = host_tb();
     u64 next = g_next_vi;
     if (g_dec_armed && (s64)(g_dec_deadline - next) < 0) next = g_dec_deadline;
+    /* wake at least every millisecond: AI DMA (5 ms blocks), SI, ARAM, DI and card completions are serviced in
+       hw_tick and the game often idles waiting for exactly those */
+    if ((s64)(next - now) > (s64)(TB_RATE / 1000)) next = now + TB_RATE / 1000;
     if ((s64)(next - now) > 0) {
-        u64 us = (next - now) * 1000000ull / TB_RATE;
-        if (us > 20000) us = 20000;
-        { extern u64 g_pf_idle; u64 t0 = host_tb(); usleep((useconds_t)us); g_pf_idle += host_tb() - t0; }
+        extern u64 g_pf_idle; u64 t0 = host_tb();
+#ifdef _WIN32
+        /* Sleep() is coarse even at 1 ms timer resolution: sleep while far away, then yield-spin to the deadline */
+        extern void __stdcall Sleep(unsigned long);
+        while ((s64)(next - host_tb()) > (s64)(TB_RATE / 1000 * 2)) Sleep(1);
+        while ((s64)(next - host_tb()) > 0) Sleep(0);
+#else
+        usleep((useconds_t)((next - now) * 1000000ull / TB_RATE));
+#endif
+        g_pf_idle += host_tb() - t0;
     }
     rt_poll(c);
 }

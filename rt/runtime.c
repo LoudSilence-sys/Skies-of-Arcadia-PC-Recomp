@@ -253,10 +253,11 @@ void settings_save(void) {
         {"pal60", "1 = let the game use its 60 Hz (EuRGB60) mode, 0 = 50 Hz PAL"},
         {"fps60", "1 = 60 fps through frame interpolation (the game itself steps at 30)"},
         {"dc_sound", "1 = Dreamcast music and sound effects (needs dc_path.txt), 0 = GameCube"},
+        {"widescreen", "1 = 16:9 (wider view in 3D; menus and text keep their shape), 0 = original 4:3"},
     };
     FILE* f = fopen("settings.ini", "w"); if (!f) return;
     fputs("# Skies of Arcadia Legends (recompiled) settings - also editable in game: title screen > Options, or F1\n", f);
-    static const int defs[] = {3, 0, 0, 1280, 960, 1, 1, 1};
+    static const int defs[] = {3, 0, 0, 1280, 960, 1, 1, 1, 1};
     for (unsigned i = 0; i < sizeof doc / sizeof doc[0]; i++) { if (doc[i][1]) fprintf(f, "# %s: %s\n", doc[i][0], doc[i][1]); fprintf(f, "%s = %d\n", doc[i][0], settings_get(doc[i][0], defs[i])); }
     fclose(f);
 }
@@ -297,6 +298,7 @@ int main(int argc, char** argv) {
       if (!getenv("SOA_SCALE")) sc = 1;   /* headless test runs stay native */
 #endif
       g_scale = sc < 1 ? 1 : sc > 8 ? 8 : sc; }
+    { extern int g_ws; g_ws = settings_get("widescreen", 1) ? 1 : 0; if (getenv("SOA_WS")) g_ws = atoi(getenv("SOA_WS")); }
     { extern int g_use_gl; extern int gl_init(void); if (!getenv("SOA_SOFT")) { if (gl_init()) g_use_gl = 1; else rt_log("GL init failed: software renderer\n"); } }
     static Ctx c0; Ctx* c = &c0; g_ctx = c;
     c->msr = 0x00002032; c->hid0 = 0x0011C464; c->hid2 = 0xE0000000;

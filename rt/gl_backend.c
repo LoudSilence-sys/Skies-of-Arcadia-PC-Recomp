@@ -147,8 +147,11 @@ int g_gl_ok;
 #define EFB_W 640
 #define EFB_H 528
 int g_scale = 1;                /* internal resolution multiplier (settings.ini resolution_scale) */
-#define SW (EFB_W * g_scale)
+int g_ws;                       /* widescreen: the EFB is 4/3 wider; the game's 640-wide picture is squeezed into it (gx.c) */
+#define SW ((int)(EFB_W * g_scale * (g_ws ? 4.0 / 3.0 : 1.0) + 0.5))
 #define SH (EFB_H * g_scale)
+#define XS(v) ((int)((double)(v) * SW / EFB_W + 0.5))   /* EFB x (logical) -> framebuffer x */
+#define YS(v) ((v) * g_scale)
 static GLuint g_rfbo, g_rtex, g_rdepth;   /* native-resolution resolve target for EFB readbacks */
 
 static GLuint compile(GLenum t, const char* src) {
@@ -190,7 +193,7 @@ int gl_init(void) {
     u_order = glGetUniformLocation(g_prog, "u_order"); u_ksel = glGetUniformLocation(g_prog, "u_ksel");
     u_misc = glGetUniformLocation(g_prog, "u_misc"); u_reg = glGetUniformLocation(g_prog, "u_reg"); u_konst = glGetUniformLocation(g_prog, "u_konst");
     u_fog = glGetUniformLocation(g_prog, "u_fog"); u_fogcol = glGetUniformLocation(g_prog, "u_fogcol"); u_fogmode = glGetUniformLocation(g_prog, "u_fogmode");
-    u_scale = glGetUniformLocation(g_prog, "u_scale"); glUniform1f(u_scale, (float)g_scale);
+    u_scale = glGetUniformLocation(g_prog, "u_scale"); glUniform1f(u_scale, (float)SW / EFB_W);
     u_fogk = glGetUniformLocation(g_prog, "u_fogk"); u_fogrc = glGetUniformLocation(g_prog, "u_fogrc");
     u_ind = glGetUniformLocation(g_prog, "u_ind"); u_imtx = glGetUniformLocation(g_prog, "u_imtx");
     for (int i = 0; i < 8; i++) { char n[16]; snprintf(n, sizeof n, "u_tex%d", i); u_tex[i] = glGetUniformLocation(g_prog, n); glUniform1i(u_tex[i], i); }
@@ -288,7 +291,7 @@ int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, 
         glGenVertexArrays(1, &g_cvao);
     }
     int tw = half ? w / 2 : w, th = half ? h / 2 : h; if (tw < 1 || th < 1) return 1;
-    int gw = tw * g_scale, gh = th * g_scale;
+    int gw = XS(tw), gh = YS(th);
     u32 a = dst & 0x01FFFFFF;
     int replay = gx_replaying();
     CopyEnt* e = 0; CopyEnt* old = &g_copies[0];
@@ -438,11 +441,17 @@ static void gl_flush_(void) {
     u32* bp = gx_bp_regs();
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH);
     glUseProgram(g_prog); glBindVertexArray(g_vao);
+    /* skip re-uploading the shader constants when none of the registers they come from changed since the last draw */
+    static u32 g_ulast[0x50 + 0x40 + 16 + 1]; static int g_uvalid; u32 ucur[0x50 + 0x40 + 16 + 1];
+    { extern u32 g_tevcol[2][8]; memcpy(ucur, bp, 0x50 * 4); memcpy(ucur + 0x50, bp + 0xC0, 0x40 * 4); memcpy(ucur + 0x90, g_tevcol, 16 * 4); ucur[0xA0] = (u32)g_scale << 1 | (u32)g_ws; }
+    int same = g_uvalid && !memcmp(ucur, g_ulast, sizeof ucur);
+    memcpy(g_ulast, ucur, sizeof ucur); g_uvalid = 1;
+    int noalpha = (bp[0x43] & 7) != 1;
+    if (!same) {
     u32 cenv[16], aenv[16];
     for (int i = 0; i < 16; i++) { cenv[i] = bp[0xC0 + 2 * i]; aenv[i] = bp[0xC1 + 2 * i]; }
     glUniform1uiv(u_cenv, 16, cenv); glUniform1uiv(u_aenv, 16, aenv);
     glUniform1uiv(u_order, 8, bp + 0x28); glUniform1uiv(u_ksel, 8, bp + 0xF6);
-    int noalpha = (bp[0x43] & 7) != 1;
     u32 misc[6] = { bp[0x00], bp[0xF3], (u32)noalpha, bp[0x42], bp[0xF4] & 0xFFFFFF, bp[0xF5] }; glUniform1uiv(u_misc, 6, misc);
     float reg[4][4], konst[4][4]; gx_tev_colors(reg, konst);
     glUniform4fv(u_reg, 4, &reg[0][0]); glUniform4fv(u_konst, 4, &konst[0][0]);
@@ -482,6 +491,7 @@ static void gl_flush_(void) {
         }
         glUniform1uiv(u_ind, 40, ind); glUniform1iv(u_imtx, 24, mt);
     }
+    }   /* !same */
     /* textures used by enabled TEV stages and indirect stages */
     int ns = ((bp[0x00] >> 10) & 15) + 1; u32 used = 0;
     { int nind = (bp[0x00] >> 16) & 7; static int logged; if (nind && logged < 8) { logged++; rt_log("GL: indirect draw nind=%d iref=%06X cmd0=%06X cmd1=%06X mtx0=%06X %06X %06X\n", nind, bp[0x27], bp[0x10], bp[0x11], bp[0x06], bp[0x07], bp[0x08]); } for (int i = 0; i < nind && i < 4; i++) used |= 1u << ((bp[0x27] >> (6 * i)) & 7); }
@@ -505,7 +515,7 @@ static void gl_flush_(void) {
     /* scissor */
     u32 sc0 = bp[0x20], sc1 = bp[0x21];
     int sy0 = (sc0 & 0x7FF) - 342, sx0 = ((sc0 >> 12) & 0x7FF) - 342, sy1 = (sc1 & 0x7FF) - 342, sx1 = ((sc1 >> 12) & 0x7FF) - 342;
-    if (sx1 >= sx0 && sy1 >= sy0) { glEnable(GL_SCISSOR_TEST); glScissor(sx0 * g_scale, (EFB_H - 1 - sy1) * g_scale, (sx1 - sx0 + 1) * g_scale, (sy1 - sy0 + 1) * g_scale); }
+    if (sx1 >= sx0 && sy1 >= sy0) { glEnable(GL_SCISSOR_TEST); glScissor(XS(sx0), YS(EFB_H - 1 - sy1), XS(sx1 + 1) - XS(sx0), YS(sy1 - sy0 + 1)); }
     else glDisable(GL_SCISSOR_TEST);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_nv * 36 * 4, g_vb, GL_STREAM_DRAW);
@@ -516,9 +526,9 @@ static void gl_flush_(void) {
 /* read EFB region (y down) into RGBA8 buffer laid out EFB_W wide */
 void gl_read_efb(u32* dst, int x, int y, int w, int h) {
     gl_flush(); u64 t0 = host_tb(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_SCISSOR_TEST);
-    if (g_scale > 1) {   /* downsample the scaled region to native size first */
+    if (SW != EFB_W || SH != EFB_H) {   /* downsample the scaled region to native size first */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_rfbo);
-        glBlitFramebuffer(x * g_scale, (EFB_H - y - h) * g_scale, (x + w) * g_scale, (EFB_H - y) * g_scale, x, EFB_H - y - h, x + w, EFB_H - y, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBlitFramebuffer(XS(x), YS(EFB_H - y - h), XS(x + w), YS(EFB_H - y), x, EFB_H - y - h, x + w, EFB_H - y, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         glBindFramebuffer(GL_FRAMEBUFFER, g_rfbo);
     } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
     static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
@@ -530,9 +540,9 @@ void gl_read_efb(u32* dst, int x, int y, int w, int h) {
 /* read EFB depth (24-bit) into a buffer laid out EFB_W wide */
 void gl_read_efb_depth(u32* dst, int x, int y, int w, int h) {
     gl_flush(); glDisable(GL_SCISSOR_TEST);
-    if (g_scale > 1) {
+    if (SW != EFB_W || SH != EFB_H) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_rfbo);
-        glBlitFramebuffer(x * g_scale, (EFB_H - y - h) * g_scale, (x + w) * g_scale, (EFB_H - y) * g_scale, x, EFB_H - y - h, x + w, EFB_H - y, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        glBlitFramebuffer(XS(x), YS(EFB_H - y - h), XS(x + w), YS(EFB_H - y), x, EFB_H - y - h, x + w, EFB_H - y, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, g_rfbo);
     } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
     static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
@@ -543,7 +553,7 @@ void gl_read_efb_depth(u32* dst, int x, int y, int w, int h) {
 void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alpha, int depth) {
     gl_flush(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    glEnable(GL_SCISSOR_TEST); glScissor(x * g_scale, (EFB_H - y - h) * g_scale, w * g_scale, h * g_scale);
+    glEnable(GL_SCISSOR_TEST); glScissor(XS(x), YS(EFB_H - y - h), XS(x + w) - XS(x), YS(h));
     glColorMask(color, color, color, alpha); glDepthMask(depth);
     glClearColor((rgba & 255) / 255.f, ((rgba >> 8) & 255) / 255.f, ((rgba >> 16) & 255) / 255.f, (rgba >> 24) / 255.f);
     glClearDepth(z24 / 16777215.0);
@@ -618,25 +628,32 @@ WEAK int options_is_open(void) { return 0; }
 void gl_overlay_into_efb(void) {
     if (!options_is_open()) return;
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    ui_begin(SW, SH); options_draw(0, (float)((EFB_H - 480) * g_scale) * 0 , 640.f * g_scale, 480.f * g_scale); ui_end();
+    ui_begin(SW, SH); { float h = 480.f * g_scale, w = h * 4 / 3; options_draw((SW - w) / 2, 0, w, h); } ui_end();
 }
 /* live resolution change: recreate the EFB at the new scale */
+static void gl_resize_efb(int ow, int oh);
 void gl_set_scale(int s) {
     if (s < 1) s = 1; if (s > 8) s = 8; if (s == g_scale) return;
-    gl_flush(); int old = g_scale; g_scale = s;
+    gl_flush(); int ow = SW, oh = SH; g_scale = s; gl_resize_efb(ow, oh);
+}
+void gl_set_widescreen(int on) {
+    on = on ? 1 : 0; if (on == g_ws) return;
+    gl_flush(); int ow = SW, oh = SH; g_ws = on; gl_resize_efb(ow, oh);
+    rt_log("GL: widescreen %s\n", on ? "on" : "off");
+}
+static void gl_resize_efb(int ow, int oh) {
     glBindTexture(GL_TEXTURE_2D, g_fbtex); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
     glBindRenderbuffer(GL_RENDERBUFFER, g_fbdepth); glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, SW, SH);
     if (g_stex) {   /* keep the paused frame visible under the options screen: rescale it into a new texture */
-        int ow = EFB_W * old, oh = EFB_H * old;
         GLuint nt, nf; glGenTextures(1, &nt); glBindTexture(GL_TEXTURE_2D, nt); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
         glGenFramebuffers(1, &nf); glBindFramebuffer(GL_FRAMEBUFFER, nf); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nt, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_sfbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, nf);
         glBlitFramebuffer(0, 0, ow, oh, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         glDeleteFramebuffers(1, &g_sfbo); glDeleteTextures(1, &g_stex); g_sfbo = nf; g_stex = nt;
     }
-    glUseProgram(g_prog); glUniform1f(u_scale, (float)g_scale);
+    glUseProgram(g_prog); glUniform1f(u_scale, (float)SW / EFB_W);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH);
-    rt_log("GL: internal resolution %dx%d\n", 640 * s, 480 * s);
+    rt_log("GL: internal resolution %dx%d\n", SW, 480 * g_scale);
 }
 
 /* frame interpolation: the real frame is kept in a texture while the in-between frame is shown */
@@ -659,10 +676,11 @@ void gl_blit_to_screen(int w, int h) {
     glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glViewport(0, 0, w, h); glClearColor(0, 0, 0, 1); glColorMask(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
-    int dw = w, dh = w * 3 / 4; if (dh > h) { dh = h; dw = h * 4 / 3; }
+    int an = g_ws ? 16 : 4, ad = g_ws ? 9 : 3;
+    int dw = w, dh = w * ad / an; if (dh > h) { dh = h; dw = h * an / ad; }
     int dx = (w - dw) / 2, dy = (h - dh) / 2;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
-    glBlitFramebuffer(0, (EFB_H - 480) * g_scale, 640 * g_scale, EFB_H * g_scale, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    if (options_is_open()) { glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h); options_draw((float)dx, (float)(h - dy - dh), (float)dw, (float)dh); ui_end(); }
+    glBlitFramebuffer(0, YS(EFB_H - 480), SW, SH, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (options_is_open()) { glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h); float ow = dh * 4.f / 3.f; options_draw(dx + (dw - ow) / 2, (float)(h - dy - dh), ow, (float)dh); ui_end(); }
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
 }

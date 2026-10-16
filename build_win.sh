@@ -7,7 +7,7 @@ T=${LLVM_MINGW:-/home/claude/decomp/tools/mingw/llvm-mingw-20250924-ucrt-ubuntu-
 CC=$T/x86_64-w64-mingw32-clang
 mkdir -p build_win
 cp rt/rt.h out/
-for f in out/gen_*.c out/table.c; do o=build_win/$(basename $f .c).o; [ $o -nt $f ] && [ $o -nt rt/rt.h ] || echo $f; done | xargs -r -P 2 -I{} sh -c "$CC -O1 -w -c {} -o build_win/\$(basename {} .c).o"
+for f in out/gen_*.c out/table.c; do o=build_win/$(basename $f .c).o; [ $o -nt $f ] && [ $o -nt rt/rt.h ] || echo $f; done | xargs -r -P 4 -I{} sh -c "$CC -O2 -w -c {} -o build_win/\$(basename {} .c).o"
 $CC -c rt/dolblob.S -o build_win/dolblob.o
 HTDEF="-DEMU_COMPILE -DEMU_LITTLE_ENDIAN -DHAVE_STDINT_H -DUSE_M68K -DLSB_FIRST"
 for f in rt/ht/*.c rt/ht/m68k/*.c; do o=build_win/ht_$(basename $f .c).o; [ $o -nt $f ] || $CC -O2 -w $HTDEF -c $f -o $o; done

@@ -2,6 +2,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
 #include <stdio.h>
 #include "rt.h"
 #include "glmini.h"
@@ -56,6 +57,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 typedef HGLRC (WINAPI* PFNCREATECTX)(HDC, HGLRC, const int*);
 int platform_init(void) {
     HINSTANCE inst = GetModuleHandleA(0);
+    timeBeginPeriod(1);   /* 1 ms scheduler resolution (default is ~15.6 ms: frame waits overshoot by a whole field) */
     g_win_w = settings_get("window_width", 1280); g_win_h = settings_get("window_height", 960);
     if (g_win_w < 320) g_win_w = 320; if (g_win_h < 240) g_win_h = 240;
     WNDCLASSA wc = {0}; wc.style = CS_OWNDC; wc.lpfnWndProc = wndproc; wc.hInstance = inst; wc.lpszClassName = "SoAWin";

@@ -690,6 +690,18 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
     if (count > 65536) count = 65536;
     if (!g_tev.init || 1) { tev_regs(g_tev.reg, g_tev.konst); g_tev.init = 1; }
     for (int i = 0; i < count; i++) transform(&ins[i], &vs[i]);
+    if (g_use_gl) {   /* widescreen: squeeze into the wider EFB (it is stretched back on output) */
+        extern int g_ws;
+        if (g_ws) {
+            int squeeze = 1;
+            if (xf_reg[0x26] != 0) {   /* orthographic (2D): keep its shape, centred - unless it spans the whole width (fades, backdrops) */
+                float lo = 1e9f, hi = -1e9f;
+                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; float x = vs[i].x / w; if (x < lo) lo = x; if (x > hi) hi = x; }
+                if (lo <= -0.98f && hi >= 0.98f) squeeze = 0;
+            }
+            if (squeeze) for (int i = 0; i < count; i++) vs[i].x *= 0.75f;
+        }
+    }
     if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
     u64 tris0 = g_tris; g_rej[0] = g_rej[1] = g_rej[2] = 0;
     switch (prim) {
@@ -1042,11 +1054,14 @@ presented:;
     {   /* every ~5 s: frame rate and where the host time went (ms per frame) */
         extern u64 g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle; static u64 t0, n;
         u64 now = host_tb(); n++;
+        static u64 last, maxdt, slow;
+        if (last) { u64 dt = now - last; if (dt > maxdt) maxdt = dt; if (dt > 40500000ull * 45 / 1000) slow++; }   /* frames taking > 45 ms */
+        last = now;
         if (!t0) t0 = now;
         else if (now - t0 > 5ull * 40500000ull) {
             double ms = 1000.0 / 40500000.0 / n;
-            rt_log("perf: %.1f fps | per frame ms: flush %.2f (hash %.2f, upload %.2f) readback %.2f present %.2f dc-sound %.2f idle %.2f | draws %.0f\n", n * 40500000.0 / (now - t0),
-                   g_pf_flush * ms, g_pf_hash * ms, g_pf_upload * ms, g_pf_read * ms, g_pf_present * ms, g_pf_snd * ms, g_pf_idle * ms, (double)g_pf_draws / n);
+            rt_log("perf: %.1f fps | per frame ms: flush %.2f (hash %.2f, upload %.2f) readback %.2f present %.2f dc-sound %.2f idle %.2f | draws %.0f | worst frame %.1f ms, %llu over 45 ms\n", n * 40500000.0 / (now - t0),
+                   g_pf_flush * ms, g_pf_hash * ms, g_pf_upload * ms, g_pf_read * ms, g_pf_present * ms, g_pf_snd * ms, g_pf_idle * ms, (double)g_pf_draws / n, maxdt * 1000.0 / 40500000.0, (unsigned long long)slow); maxdt = 0; slow = 0;
             t0 = now; n = 0; g_pf_hash = g_pf_flush = g_pf_read = g_pf_present = g_pf_draws = g_pf_upload = g_pf_snd = g_pf_idle = 0;
         }
     }
