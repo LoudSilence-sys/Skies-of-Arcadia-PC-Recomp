@@ -45,6 +45,7 @@ void gx_xf(u32 addr, int n, const u8* d) {
         if (i < 16) vals[i] = v;
         xf_store(addr + i, v);
     }
+    { extern int g_dbgf, g_frame_no_pub; if (g_dbgf && g_frame_no_pub == g_dbgf && addr >= 0x1000) { rt_log("   xfreg %04X x%d:", addr, n); for (int i = 0; i < n && i < 16; i++) rt_log(" %08X", vals[i]); rt_log("\n"); } }
     if (g_rec && n <= 16) rec_xf(addr, (u32)n, vals);
 }
 void gx_xf_indexed(int which, u32 v) {
@@ -85,7 +86,7 @@ void gx_bp(u32 v) {
 }
 
 /* ---------------- vertex decoding ---------------- */
-typedef struct { float pos[3], nrm[3]; float col[2][4]; float tex[8][2]; int pmi, tmi[8]; int has_nrm; } InV;
+typedef struct { float pos[3], nrm[3]; float col[2][4]; float tex[8][2]; int pmi, tmi[8]; int has_nrm; int has_col[2]; } InV;
 typedef struct { float x, y, z, w; float col[2][4]; float tex[8][3]; } OutV;
 
 static float rdcomp(const u8* p, int fmt, int shift) {
@@ -147,7 +148,7 @@ static const u8* decode_vertex(const u8* p, int vat, InV* v) {
     /* colors */
     for (int c = 0; c < 2; c++) {
         int ct = (lo >> (13 + 2 * c)) & 3, cf = (A >> (14 + 4 * c)) & 7;
-        v->col[c][0] = v->col[c][1] = v->col[c][2] = v->col[c][3] = 1.0f;
+        v->col[c][0] = v->col[c][1] = v->col[c][2] = v->col[c][3] = 1.0f; v->has_col[c] = ct != 0;
         if (ct == 1) { rdcolor(p, cf, v->col[c]); p += col_sz(cf); }
         else if (ct >= 2) { u32 idx = ct == 2 ? p[0] : (p[0] << 8 | p[1]); p += ct == 2 ? 1 : 2; rdcolor(arr_ptr(2 + c, idx), cf, v->col[c]); }
     }
@@ -192,20 +193,22 @@ static void light_channel(int chan, const InV* in, const float* vpos, const floa
                 float lp[3] = {xff(lb + 10), xff(lb + 11), xff(lb + 12)}, ld[3] = {xff(lb + 13), xff(lb + 14), xff(lb + 15)};
                 float L[3] = {lp[0] - vpos[0], lp[1] - vpos[1], lp[2] - vpos[2]};
                 float dist2 = L[0] * L[0] + L[1] * L[1] + L[2] * L[2], dist = sqrtf(dist2);
-                float Ln[3] = {0, 0, 0}; if (dist > 0) { Ln[0] = L[0] / dist; Ln[1] = L[1] / dist; Ln[2] = L[2] / dist; }
+                float Ln[3] = {vn[0], vn[1], vn[2]}; if (dist > 0) { Ln[0] = L[0] / dist; Ln[1] = L[1] / dist; Ln[2] = L[2] / dist; }   /* light at the vertex: ldir = normal (as Dolphin) */
                 float d = vn[0] * Ln[0] + vn[1] * Ln[1] + vn[2] * Ln[2];
                 if (dfn == 0) d = 1; else if (dfn == 2) d = d < 0 ? 0 : d;
                 float att = 1;
                 if (atten) {
                     float a0 = xff(lb + 4), a1 = xff(lb + 5), a2 = xff(lb + 6), k0 = xff(lb + 7), k1 = xff(lb + 8), k2 = xff(lb + 9);
-                    if (spot) {
-                        float cs = -(Ln[0] * ld[0] + Ln[1] * ld[1] + Ln[2] * ld[2]); if (cs < 0) cs = 0;
+                    if (spot) {   /* as Dolphin: cos = dot(ldir, dir), no negation (the SDK stores -dir) */
+                        float cs = Ln[0] * ld[0] + Ln[1] * ld[1] + Ln[2] * ld[2]; if (cs < 0) cs = 0;
                         float num = a0 + a1 * cs + a2 * cs * cs; if (num < 0) num = 0;
                         float den = k0 + k1 * dist + k2 * dist2; att = den != 0 ? num / den : 0;
-                    } else {   /* specular */
+                    } else {   /* specular: the distance coefficients are normalised unless the diffuse function is NONE (hardware quirk, as Dolphin) */
                         float h = vn[0] * ld[0] + vn[1] * ld[1] + vn[2] * ld[2]; if (h < 0) h = 0;
-                        float num = a0 + a1 * h + a2 * h * h; float den = k0 + k1 * h + k2 * h * h; att = den != 0 ? num / den : 0;
-                        if (vn[0] * Ln[0] + vn[1] * Ln[1] + vn[2] * Ln[2] <= 0) att = 0;
+                        if (vn[0] * Ln[0] + vn[1] * Ln[1] + vn[2] * Ln[2] < 0) h = 0;
+                        float kl = dfn != 0 ? sqrtf(k0 * k0 + k1 * k1 + k2 * k2) : 1.0f; if (kl == 0) kl = 1;
+                        float num = a0 + a1 * h + a2 * h * h; if (num < 0) num = 0;
+                        float den = (k0 + k1 * h + k2 * h * h) / kl; att = den != 0 ? num / den : 0;
                     }
                 }
                 for (int k = 0; k < 4; k++) acc[k] += d * att * lc[k];
@@ -229,8 +232,10 @@ static void transform(const InV* in, OutV* o) {
     if (xf_reg[0x26] == 0) { o->x = P[0] * vp[0] + P[1] * vp[2]; o->y = P[2] * vp[1] + P[3] * vp[2]; o->z = P[4] * vp[2] + P[5]; o->w = -vp[2]; }
     else { o->x = P[0] * vp[0] + P[1]; o->y = P[2] * vp[1] + P[3]; o->z = P[4] * vp[2] + P[5]; o->w = 1; }
     int ncol = xf_reg[0x09] & 3;
-    for (int c = 0; c < 2; c++) {
-        if (c < ncol || 1) light_channel(c, in, vp, vn, o->col[c]);
+    {
+        InV tmp; const InV* src = in;
+        if (!in->has_col[0] && in->has_col[1]) { tmp = *in; memcpy(tmp.col[0], in->col[1], sizeof tmp.col[0]); src = &tmp; }   /* only colour 1 given: it drives channel 0 */
+        for (int c = 0; c < 2; c++) light_channel(c, src, vp, vn, o->col[c]);
     }
     int ntg = xf_reg[0x3F] & 15; int dual = xf_reg[0x12] & 1;
     for (int t = 0; t < 8; t++) {
@@ -304,7 +309,7 @@ static u32 texel(const TexDesc* t, int x, int y) {
         u16 c0 = p[0] << 8 | p[1], c1 = p[2] << 8 | p[3]; u32 cols[4]; cols[0] = rgb565(c0); cols[1] = rgb565(c1);
         u32 r0 = cols[0] & 255, g0 = (cols[0] >> 8) & 255, b0 = (cols[0] >> 16) & 255, r1 = cols[1] & 255, g1 = (cols[1] >> 8) & 255, b1 = (cols[1] >> 16) & 255;
         if (c0 > c1) { cols[2] = ((2 * r0 + r1) / 3) | ((2 * g0 + g1) / 3) << 8 | ((2 * b0 + b1) / 3) << 16 | 0xFF000000u; cols[3] = ((r0 + 2 * r1) / 3) | ((g0 + 2 * g1) / 3) << 8 | ((b0 + 2 * b1) / 3) << 16 | 0xFF000000u; }
-        else { cols[2] = ((r0 + r1) / 2) | ((g0 + g1) / 2) << 8 | ((b0 + b1) / 2) << 16 | 0xFF000000u; cols[3] = 0; }
+        else { cols[2] = ((r0 + r1) / 2) | ((g0 + g1) / 2) << 8 | ((b0 + b1) / 2) << 16 | 0xFF000000u; cols[3] = cols[2] & 0x00FFFFFFu; }
         int px = x % 4, py = y % 4; int sel = (p[4 + py] >> (6 - 2 * px)) & 3;
         return cols[sel];
     }
@@ -520,7 +525,7 @@ void gx_tex_decode(int map, u32* out) {
     for (u32 y = 0; y < d.h; y++) for (u32 x = 0; x < d.w; x++) out[y * d.w + x] = texel(&d, x, y);
 }
 void gx_dump_efb(const char* path, int w, int h);
-void gl_vertex(const float* pos4, const float* c0, const float* c1, const float tex[8][3]);
+void gl_vertex(const float* pos4, const float* clip4, const float* c0, const float* c1, const float tex[8][3]);
 void gl_flush(void);
 void gl_read_efb(u32* dst, int x, int y, int w, int h);
 void gl_read_efb_depth(u32* dst, int x, int y, int w, int h);
@@ -617,6 +622,7 @@ static int cull_reject(const OutV* v0, const OutV* v1, const OutV* v2) {
     if (cull == 0) return 0; if (cull == 3) return 1;
     float nz = (v0->x * v2->w - v2->x * v0->w) * v1->y + (v2->x * v0->y - v0->x * v2->y) * v1->w + (v2->y * v0->w - v0->y * v2->w) * v1->x;
     int back = nz <= 0; if (xff(0x101B) > 0) back = !back;
+    if (g_exp & 4) back = !back;   /* experiment: inverted culling */
     return cull == 1 ? !back : back;
 }
 /* clip against near plane (z <= 0 in GX clip space means visible: -w <= z <= 0) */
@@ -633,28 +639,31 @@ static void clip_tri(const OutV* a, const OutV* b, const OutV* c) {
     }
     if (m < 3) { g_rej[0]++; return; }
     SV s[8]; for (int i = 0; i < m; i++) { if (out[i].w <= 0) { g_rej[1]++; return; } to_screen(&out[i], &s[i]); }
-    if (g_use_gl) {
-
-        g_tris++;
-        for (int i = 1; i + 1 < m; i++) {
-            int idx[3] = {0, i, i + 1};
-            for (int k = 0; k < 3; k++) {
-                const SV* v = &s[idx[k]]; const OutV* o = &out[idx[k]]; float w = o->w;
-                float zn = v->z / 16777215.f; if (zn < 0) zn = 0; if (zn > 1) zn = 1;
-                float pos[4] = {(v->x / 320.f - 1.f) * w, (1.f - v->y / 264.f) * w, (zn * 2.f - 1.f) * w, w};
-                gl_vertex(pos, o->col[0], o->col[1], o->tex);
-            }
-        }
-        return;
-    }
     for (int i = 1; i + 1 < m; i++) raster_tri(&s[0], &s[i], &s[i + 1]);
+}
+/* GL path: the triangle goes to the GPU unclipped, in GX clip space mapped through the viewport (still scaled by w);
+   the vertex shader clips it against the GX near and far planes (clip distances) and depth is clamped, as Dolphin. */
+static int g_clip43;   /* widescreen: clip this draw to the centred 4:3 region (2D elements) */
+static void tri_gl(const OutV* a, const OutV* b, const OutV* c) {
+    if (cull_reject(a, b, c)) { g_rej[2]++; return; }
+    g_tris++;
+    const float sx = xff(0x101A), sy = xff(0x101B), sz = xff(0x101C), ox = xff(0x101D) - 342.f, oy = xff(0x101E) - 342.f, oz = xff(0x101F);
+    const OutV* v[3] = {a, b, c};
+    for (int k = 0; k < 3; k++) {
+        const OutV* o = v[k]; float w = o->w;
+        float pos[4] = {(o->x * sx + ox * w) * (1.f / 320.f) - w, w - (o->y * sy + oy * w) * (1.f / 264.f), (o->z * sz + oz * w) * (2.f / 16777215.f) - w, w};
+        float clip[4] = {o->z + w, -o->z, 1, 1};
+        if (g_clip43) { clip[2] = 0.75f * w - pos[0]; clip[3] = 0.75f * w + pos[0]; }   /* |x| <= 0.75 w: the 4:3 part of the 16:9 frame */
+        gl_vertex(pos, clip, o->col[0], o->col[1], o->tex);
+    }
 }
 
 /* lines and points: expanded to screen-space quads (width from SU_LPSIZE, BP 0x22, in 1/6 pixel) */
 static void emit_sv(const SV* v, const OutV* o) {
     float w = o->w; float zn = v->z / 16777215.f; if (zn < 0) zn = 0; if (zn > 1) zn = 1;
     float pos[4] = {(v->x / 320.f - 1.f) * w, (1.f - v->y / 264.f) * w, (zn * 2.f - 1.f) * w, w};
-    gl_vertex(pos, o->col[0], o->col[1], o->tex);
+    static const float inside[4] = {1, 1, 1, 1};
+    gl_vertex(pos, inside, o->col[0], o->col[1], o->tex);
 }
 static void quad_sv(SV q[4], const OutV* oa, const OutV* ob, const OutV* oc, const OutV* od) {
     if (g_use_gl) { emit_sv(&q[0], oa); emit_sv(&q[1], ob); emit_sv(&q[2], oc); emit_sv(&q[0], oa); emit_sv(&q[2], oc); emit_sv(&q[3], od); }
@@ -681,15 +690,19 @@ static void draw_point(const OutV* a) {
     quad_sv(q, a, a, a, a);
 }
 
-static void rec_draw(int prim, int vat, int count, const InV* ins);
+static void rec_draw(int prim, int vat, int count, const OutV* vs, int pmi0);
 static void draw_core(int prim, int vat, int count, const InV* ins, const u8* data, int vsize);
+u64 g_pf_xform, g_pf_verts;   /* CPU vertex decode + transform time, vertices per frame (perf line) */
+int g_dbg_draw_no;             /* draw counter within the debug frame */
+static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int vsize);
 void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     static InV ins[65536];
+    u64 t0 = host_tb();
     if (count > 65536) count = 65536;
     const u8* p = data;
     for (int i = 0; i < count; i++) { decode_vertex(p, vat, &ins[i]); p += vsize; }
-    if (g_rec) rec_draw(prim, vat, count, ins);
     draw_core(prim, vat, count, ins, data, vsize);
+    g_pf_xform += host_tb() - t0; g_pf_verts += (u64)count;
 }
 static void draw_core(int prim, int vat, int count, const InV* ins, const u8* data, int vsize) {
     { static int n; extern int g_frame_no_pub; if (g_frame_no_pub > 600 && n < 6) { n++;
@@ -699,6 +712,11 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
     if (count > 65536) count = 65536;
     if (!g_tev.init || 1) { tev_regs(g_tev.reg, g_tev.konst); g_tev.init = 1; }
     for (int i = 0; i < count; i++) transform(&ins[i], &vs[i]);
+    if (g_rec) rec_draw(prim, vat, count, vs, count ? ins[0].pmi : 0);   /* frame interpolation records the transformed vertices */
+    draw_out(prim, vat, count, vs, data, vsize);
+}
+/* transformed vertices -> primitives (also the frame-interpolation replay path) */
+static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int vsize) {
     if (g_use_gl) {   /* widescreen: squeeze into the wider EFB (it is stretched back on output) */
         extern int g_ws;
         if (g_ws) {
@@ -712,15 +730,19 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
                 if (lo <= -0.98f && hi >= 0.98f) squeeze = 0;
             }
             if (squeeze) for (int i = 0; i < count; i++) vs[i].x *= 0.75f;
-        }
+            /* 2D elements keep the 4:3 frame they were laid out for: anything beyond its edges (menus parked
+               off-screen, sliding panels) is clipped there instead of showing up in the wider picture */
+            g_clip43 = squeeze && xf_reg[0x26] != 0;
+        } else g_clip43 = 0;
     }
     if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
     u64 tris0 = g_tris; g_rej[0] = g_rej[1] = g_rej[2] = 0;
+    void (*tri)(const OutV*, const OutV*, const OutV*) = g_use_gl ? tri_gl : clip_tri;
     switch (prim) {
-    case 0: for (int i = 0; i + 3 < count; i += 4) { clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); clip_tri(&vs[i], &vs[i + 2], &vs[i + 3]); } break;
-    case 2: for (int i = 0; i + 2 < count; i += 3) clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); break;
-    case 3: for (int i = 0; i + 2 < count; i++) { if (i & 1) clip_tri(&vs[i + 1], &vs[i], &vs[i + 2]); else clip_tri(&vs[i], &vs[i + 1], &vs[i + 2]); } break;
-    case 4: for (int i = 1; i + 1 < count; i++) clip_tri(&vs[0], &vs[i], &vs[i + 1]); break;
+    case 0: for (int i = 0; i + 3 < count; i += 4) { tri(&vs[i], &vs[i + 1], &vs[i + 2]); tri(&vs[i], &vs[i + 2], &vs[i + 3]); } break;
+    case 2: for (int i = 0; i + 2 < count; i += 3) tri(&vs[i], &vs[i + 1], &vs[i + 2]); break;
+    case 3: for (int i = 0; i + 2 < count; i++) { if (i & 1) tri(&vs[i + 1], &vs[i], &vs[i + 2]); else tri(&vs[i], &vs[i + 1], &vs[i + 2]); } break;
+    case 4: for (int i = 1; i + 1 < count; i++) tri(&vs[0], &vs[i], &vs[i + 1]); break;
     case 5: for (int i = 0; i + 1 < count; i += 2) draw_line(&vs[i], &vs[i + 1]); break;
     case 6: for (int i = 0; i + 1 < count; i++) draw_line(&vs[i], &vs[i + 1]); break;
     case 7: for (int i = 0; i < count; i++) draw_point(&vs[i]); break;
@@ -729,15 +751,17 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
     if (g_replay || !data) return;
     { extern int g_dbgf; int dbgf = g_dbgf; extern int g_frame_no_pub;
       static u32 dtex[4]; static int dtn = -1; if (dtn < 0) { dtn = 0; const char* e = getenv("SOA_DBGTEX"); if (e) dtn = sscanf(e, "%x,%x,%x,%x", &dtex[0], &dtex[1], &dtex[2], &dtex[3]); }
-      int texhit = 0; if (dtn > 0) { static int hits; TexDesc d0; get_tex(bp[0x28] & 7, &d0); for (int k = 0; k < dtn; k++) if (d0.addr == dtex[k] && hits < 40) { texhit = 1; hits++; } }
+      static int dtf = -1; if (dtf < 0) { dtf = 0; const char* e = getenv("SOA_DBGTEXF"); if (e) dtf = atoi(e); }
+      int texhit = 0; if (dtn > 0 && g_frame_no_pub >= dtf) { static int hits; TexDesc d0; get_tex(bp[0x28] & 7, &d0); for (int k = 0; k < dtn; k++) if (d0.addr == dtex[k] && hits < 40) { texhit = 1; hits++; } }
       if ((dbgf && g_frame_no_pub == dbgf) || texhit) {
-        static int nd; nd++;
-        if (texhit) { extern void rt_backtrace(Ctx*); rt_backtrace(g_ctx); }
+        static int nd; nd++; g_dbg_draw_no = nd;
+        if (texhit) { extern void rt_backtrace(Ctx*); extern int g_in_irq; rt_log("  thread %08X in_irq %d msr %08X frame %d\n", R32(0x800000E4), g_in_irq, g_ctx->msr, g_frame_no_pub); rt_backtrace(g_ctx); }
         if (g_use_gl) gl_read_efb(efb_c, 0, 0, 640, 480);
         double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
         int ns = ((bp[0] >> 10) & 15) + 1;
-        rt_log("D%d tris %d rej %u/%u/%u prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X %06X ras0 %08X %08X ind %06X fog %06X\n", nd, (int)(g_tris - tris0), g_rej[0], g_rej[1], g_rej[2], prim, count, vat,
-            m[0] / 4800, m[1] / 4800, m[2] / 4800, bp[0], ns, bp[0x41], bp[0x40], bp[0xF3], bp[0x43], bp[0xC0], bp[0xC1], bp[0x28], bp[0x29], xf_reg[0x0E], xf_reg[0x0C], bp[0x10], bp[0xF2]);
+        { static int px = -1, py; if (px < 0) { px = 150; py = 250; const char* e = getenv("SOA_DBGPIX"); if (e) sscanf(e, "%d,%d", &px, &py); } rt_log("   pix(%d,%d) %08X\n", px, py, efb_c[py * EFB_W + px]); }
+        rt_log("D%d tris %d rej %u/%u/%u prim %d n %d vat %d | rgb %3.0f %3.0f %3.0f | gen %06X ns %d blend %06X z %06X ac %06X pix %06X c0 %06X a0 %06X ord %06X %06X ras0 %08X %08X ind %06X fog %06X [%06X %06X %06X %06X rng %06X]\n", nd, (int)(g_tris - tris0), g_rej[0], g_rej[1], g_rej[2], prim, count, vat,
+            m[0] / 4800, m[1] / 4800, m[2] / 4800, bp[0], ns, bp[0x41], bp[0x40], bp[0xF3], bp[0x43], bp[0xC0], bp[0xC1], bp[0x28], bp[0x29], xf_reg[0x0E], xf_reg[0x0C], bp[0x10], bp[0xF2], bp[0xEE], bp[0xEF], bp[0xF0], bp[0xF1], bp[0xE8]);
         { float bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9, amin = 9, amax = -9; const u8* pp = data;
           for (int i = 0; i < count && i < 64; i++) { InV iv; decode_vertex(pp, vat, &iv); pp += vsize; OutV ov; transform(&iv, &ov); SV sv; to_screen(&ov, &sv);
             if (sv.x < bx0) bx0 = sv.x; if (sv.x > bx1) bx1 = sv.x; if (sv.y < by0) by0 = sv.y; if (sv.y > by1) by1 = sv.y; float a = ov.col[0][3]; if (a < amin) amin = a; if (a > amax) amax = a; }
@@ -747,7 +771,10 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
           rt_log("   konst %08X %08X %08X %08X | %08X %08X | ksel %06X %06X | reg0 %08X %08X | zm %06X sc %06X %06X\n", g_tevcol[1][0], g_tevcol[1][1], g_tevcol[1][2], g_tevcol[1][3], g_tevcol[1][6], g_tevcol[1][7], bp[0xF6], bp[0xF7], g_tevcol[0][0], g_tevcol[0][1], bp[0x40], bp[0x20], bp[0x21]); }
         { InV iv; decode_vertex(data, vat, &iv); OutV ov; transform(&iv, &ov); float sc[4] = {0, 0, 0, 0}; float q = ov.tex[0][2] ? ov.tex[0][2] : 1; sample(0, ov.tex[0][0] / q, ov.tex[0][1] / q, sc);
           rt_log("   v0: in tex %.4f %.4f tmi %d -> %.4f %.4f %.4f  sample %.2f %.2f %.2f %.2f texgen %08X vcd hi %08X\n", iv.tex[0][0], iv.tex[0][1], iv.tmi[0], ov.tex[0][0], ov.tex[0][1], ov.tex[0][2], sc[0], sc[1], sc[2], sc[3], xf_reg[0x40], g_cp_regs[0x60]); }
-        { InV iv; decode_vertex(data, vat, &iv); rt_log("   xf: ctl c0 %08X a0 %08X c1 %08X a1 %08X mat %08X %08X amb %08X %08X nchan %u | vcd %08X vatA %08X | v0 col %.3f %.3f %.3f %.3f\n", xf_reg[0x0E], xf_reg[0x10], xf_reg[0x0F], xf_reg[0x11], xf_reg[0x0C], xf_reg[0x0D], xf_reg[0x0A], xf_reg[0x0B], xf_reg[0x09], g_cp_regs[0x50], g_cp_regs[0x70 + vat], iv.col[0][0], iv.col[0][1], iv.col[0][2], iv.col[0][3]); }
+        { InV iv; decode_vertex(data, vat, &iv); rt_log("   xf: ctl c0 %08X a0 %08X c1 %08X a1 %08X mat %08X %08X amb %08X %08X nchan %u | vcd %08X vatA %08X | v0 col %.3f %.3f %.3f %.3f\n", xf_reg[0x0E], xf_reg[0x10], xf_reg[0x0F], xf_reg[0x11], xf_reg[0x0C], xf_reg[0x0D], xf_reg[0x0A], xf_reg[0x0B], xf_reg[0x09], g_cp_regs[0x50], g_cp_regs[0x70 + vat], iv.col[0][0], iv.col[0][1], iv.col[0][2], iv.col[0][3]);
+          u32 lm = ((xf_reg[0x0E] >> 2) & 15) | (((xf_reg[0x0E] >> 11) & 15) << 4);
+          for (int l = 0; l < 8; l++) if (lm & (1 << l)) { u32 lb = 0x600 + l * 16; rt_log("   light%d col %08X cos %.3f %.3f %.3f dist %.3f %.3f %.3f pos %.2f %.2f %.2f dir %.3f %.3f %.3f\n", l, xf_mem[lb + 3], xff(lb + 4), xff(lb + 5), xff(lb + 6), xff(lb + 7), xff(lb + 8), xff(lb + 9), xff(lb + 10), xff(lb + 11), xff(lb + 12), xff(lb + 13), xff(lb + 14), xff(lb + 15)); }
+          { OutV ov; transform(&iv, &ov); rt_log("   v0 lit col %.3f %.3f %.3f %.3f  nrm %.3f %.3f %.3f\n", ov.col[0][0], ov.col[0][1], ov.col[0][2], ov.col[0][3], iv.nrm[0], iv.nrm[1], iv.nrm[2]); } }
         for (int s2 = 0; s2 < ns; s2++) { u32 o = bp[0x28 + s2 / 2]; if (s2 & 1) o >>= 12; if (!((o >> 6) & 1)) continue; int mp = o & 7; TexDesc d; get_tex(mp, &d);
             int bb = mp < 4 ? mp : mp - 4 + 0x20; double ta[4] = {0, 0, 0, 0}; int nn = 0;
             for (u32 yy = 0; yy < d.h; yy += (d.h + 7) / 8) for (u32 xx = 0; xx < d.w; xx += (d.w + 7) / 8) { u32 c = texel(&d, xx, yy); for (int k = 0; k < 4; k++) ta[k] += (c >> (8 * k)) & 255; nn++; }
@@ -772,11 +799,11 @@ static void efb_copy(u32 v) {
         extern void interp_replay_xfb(void);
         if (to_xfb) interp_replay_xfb();
         else if ((bp[0x43] & 7) != 3) {
-            extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes);
+            extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes, int gamma);
             int tpf = (v >> 3) & 15, fmt = tpf / 2 + (tpf & 1) * 8;
             int tw = half ? w / 2 : w, th = half ? h / 2 : h; int bpp = (fmt == 0) ? 4 : (fmt == 2 || fmt == 7 || fmt == 8 || fmt == 1 || fmt == 9 || fmt == 10) ? 8 : (fmt == 6) ? 32 : 16;
             int bw = bpp == 4 ? 8 : bpp == 8 ? 8 : 4, bh = bpp == 4 ? 8 : 4; u32 nb = (u32)((tw + bw - 1) / bw) * ((th + bh - 1) / bh) * (bpp == 32 ? 64 : 32);
-            gl_efb_copy_tex(sx, sy, w, h, half, fmt, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb);
+            gl_efb_copy_tex(sx, sy, w, h, half, fmt, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb, (v >> 7) & 3);
         }
         if (clear) {
             u32 ar = bp[0x4F], gb = bp[0x50], cz = bp[0x51] & 0xFFFFFF;
@@ -792,13 +819,14 @@ static void efb_copy(u32 v) {
     int tpf0 = (v >> 3) & 15, fmt0 = tpf0 / 2 + (tpf0 & 1) * 8;
     int gpu_copy = 0;
     if (g_use_gl && !to_xfb && (bp[0x43] & 7) != 3 && !g_dbgf) {   /* texture copy kept on the GPU (not depth) */
-        extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes);
+        extern int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes, int gamma);
         int tw = half ? w / 2 : w, th = half ? h / 2 : h; int bpp = (fmt0 == 0) ? 4 : (fmt0 == 2 || fmt0 == 7 || fmt0 == 8 || fmt0 == 1 || fmt0 == 9 || fmt0 == 10) ? 8 : (fmt0 == 6) ? 32 : 16;
         int bw = bpp == 4 ? 8 : bpp == 8 ? 8 : 4, bh = bpp == 4 ? 8 : 4; u32 nb = (u32)((tw + bw - 1) / bw) * ((th + bh - 1) / bh) * (bpp == 32 ? 64 : 32);
-        gpu_copy = gl_efb_copy_tex(sx, sy, w, h, half, fmt0, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb);
+        gpu_copy = gl_efb_copy_tex(sx, sy, w, h, half, fmt0, (v >> 15) & 1, (bp[0x43] & 7) != 1, dst, nb, (v >> 7) & 3);
     }
     if (g_use_gl && to_xfb && need_xfb_pixels) { extern void gl_overlay_into_efb(void); gl_overlay_into_efb(); }
-    if (g_use_gl && !gpu_copy && (!to_xfb || need_xfb_pixels)) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb(efb_c, sx, sy, rw, rh); }
+    if (g_use_gl && !gpu_copy && (!to_xfb || need_xfb_pixels)) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb(efb_c, sx, sy, rw, rh);
+        if (!to_xfb) { extern u64 g_pf_ccopy; g_pf_ccopy++; static int n; if (n++ < 12) rt_log("cpu copy: fmt %d pixfmt %d %dx%d half %d dst %08X\n", fmt0, bp[0x43] & 7, w, h, half, dst); } }
     if (to_xfb && !need_xfb_pixels) {
         g_xfb_ready = 1; g_xfb_addr = dst;
         extern void gx_frame_done(int w, int h);
@@ -826,7 +854,7 @@ static void efb_copy(u32 v) {
         u32* src = efb_c;
         if (depth) {
             static u32 zb[EFB_W * EFB_H];
-            if (g_use_gl) { int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb_depth(zb, sx, sy, rw, rh); }
+            if (g_use_gl) { extern u64 g_pf_zcopy, g_pf_ztime; u64 t0 = host_tb(); int rw = w, rh = h; if (sx + rw > EFB_W) rw = EFB_W - sx; if (sy + rh > EFB_H) rh = EFB_H - sy; if (rw > 0 && rh > 0) gl_read_efb_depth(zb, sx, sy, rw, rh); g_pf_zcopy++; g_pf_ztime += host_tb() - t0; }
             else memcpy(zb, efb_z, sizeof zb);
             for (int y = 0; y < h && sy + y < EFB_H; y++) for (int x = 0; x < w && sx + x < EFB_W; x++) { u32 z = zb[(sy + y) * EFB_W + sx + x]; zb[(sy + y) * EFB_W + sx + x] = (z >> 16 & 255) | (z >> 8 & 255) << 8 | (z & 255) << 16 | 0xFF000000u; }
             src = zb; inten = 0;
@@ -917,11 +945,12 @@ static XKey* g_pidx; static int g_pn, g_pcap;
 static void* ar_alloc(Arena* a, size_t n) { if (a->n + n > a->cap) { a->cap = (a->n + n) * 2 + (1u << 20); a->b = realloc(a->b, a->cap); } void* p = a->b + a->n; a->n += n; return p; }
 static void rec_bp(u32 v) { u32* p = ar_alloc(&g_log[g_cur], 8); p[0] = EV_BP; p[1] = v; }
 static void rec_xf(u32 addr, u32 n, const u32* v) { u32* p = ar_alloc(&g_log[g_cur], 12 + 4 * n); p[0] = EV_XF; p[1] = addr; p[2] = n; memcpy(p + 3, v, 4 * n); }
-static void rec_draw(int prim, int vat, int count, const InV* ins) {
-    /* p[0] = type | signature: the draw's texture and combiner state, so draws match the same object next frame */
+static void rec_draw(int prim, int vat, int count, const OutV* vs, int pmi0) {
+    /* p[0] = type | signature: the draw's texture and combiner state, so draws match the same object next frame;
+       p[2] = vertex format | first vertex's position matrix index << 8 (tells apart copies of one mesh) */
     u32 sig = 2166136261u; const u32 regs[] = {bp[0x94], bp[0x88], bp[0xC0], bp[0xC1], bp[0x28], bp[0x00], bp[0x41]};
     for (int i = 0; i < 7; i++) { sig ^= regs[i]; sig *= 16777619u; }
-    u32* p = ar_alloc(&g_log[g_cur], 16 + sizeof(InV) * (size_t)count); p[0] = EV_DRAW | (sig & 0xFFFFFF00u); p[1] = (u32)prim; p[2] = (u32)vat; p[3] = (u32)count; memcpy(p + 4, ins, sizeof(InV) * (size_t)count);
+    u32* p = ar_alloc(&g_log[g_cur], 16 + sizeof(OutV) * (size_t)count); p[0] = EV_DRAW | (sig & 0xFFFFFF00u); p[1] = (u32)prim; p[2] = (u32)vat | (u32)pmi0 << 8; p[3] = (u32)count; memcpy(p + 4, vs, sizeof(OutV) * (size_t)count);
 }
 static void st_save(GxState* st) { memcpy(st->bp, bp, sizeof bp); memcpy(st->xf_mem, xf_mem, sizeof xf_mem); memcpy(st->xf_reg, xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(st->tevcol, g_tevcol, sizeof st->tevcol); }
 static void st_load(const GxState* st) { memcpy(bp, st->bp, sizeof bp); memcpy(xf_mem, st->xf_mem, sizeof xf_mem); memcpy(xf_reg, st->xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(g_tevcol, st->tevcol, sizeof st->tevcol); }
@@ -931,14 +960,14 @@ static u32 g_kh_key[KH], g_kh_cnt[KH], g_kh_gen[KH], g_kgen = 1;
 static u32 key_next(u32 key) { u32 h = (key * 2654435761u) & (KH - 1); while (g_kh_gen[h] == g_kgen && g_kh_key[h] != key) h = (h + 1) & (KH - 1); if (g_kh_gen[h] != g_kgen) { g_kh_gen[h] = g_kgen; g_kh_key[h] = key; g_kh_cnt[h] = 0; } return g_kh_cnt[h]++; }
 static int xk_cmp(const void* a, const void* b) { const XKey* x = a; const XKey* y = b; return x->key != y->key ? (x->key < y->key ? -1 : 1) : (x->seq < y->seq ? -1 : x->seq > y->seq); }
 /* draws are matched by primitive, vertex format, vertex count and matrix index (bit 31 marks a draw key) */
-static u32 draw_key(const u32* e) { const InV* v = (const InV*)(e + 4); u32 k = (e[0] & 0xFFFFFF00u) ^ (e[3] * 2654435761u) ^ (e[1] << 5 | e[2] << 2) ^ ((u32)(e[3] ? v[0].pmi : 0) << 13); return k | 0x80000000u; }
+static u32 draw_key(const u32* e) { u32 k = (e[0] & 0xFFFFFF00u) ^ (e[3] * 2654435761u) ^ (e[1] << 5 | (e[2] & 0xFF) << 2) ^ ((e[2] >> 8) << 13); return k | 0x80000000u; }
 static void index_log(const Arena* a) {
     g_pn = 0; g_kgen++;
     for (size_t o = 0; o < a->n;) {
         const u32* e = (const u32*)(a->b + o);
         if ((e[0] & 0xFF) == EV_XF) { if (g_pn == g_pcap) { g_pcap = g_pcap ? g_pcap * 2 : 4096; g_pidx = realloc(g_pidx, sizeof(XKey) * g_pcap); } u32 key = e[1] << 5 | e[2]; g_pidx[g_pn].key = key; g_pidx[g_pn].seq = key_next(key); g_pidx[g_pn].off = (u32)o; g_pn++; o += 12 + 4 * e[2]; }
         else if ((e[0] & 0xFF) == EV_BP) o += 8;
-        else { if (g_pn == g_pcap) { g_pcap = g_pcap ? g_pcap * 2 : 4096; g_pidx = realloc(g_pidx, sizeof(XKey) * g_pcap); } u32 key = draw_key(e); g_pidx[g_pn].key = key; g_pidx[g_pn].seq = key_next(key); g_pidx[g_pn].off = (u32)o; g_pn++; o += 16 + sizeof(InV) * e[3]; }
+        else { if (g_pn == g_pcap) { g_pcap = g_pcap ? g_pcap * 2 : 4096; g_pidx = realloc(g_pidx, sizeof(XKey) * g_pcap); } u32 key = draw_key(e); g_pidx[g_pn].key = key; g_pidx[g_pn].seq = key_next(key); g_pidx[g_pn].off = (u32)o; g_pn++; o += 16 + sizeof(OutV) * e[3]; }
     }
     qsort(g_pidx, g_pn, sizeof(XKey), xk_cmp);
 }
@@ -984,25 +1013,32 @@ static void replay(float t) {
             for (u32 i = 0; i < n; i++) xf_store(a + i, out[i]);
             o += 12 + 4 * n;
         } else {
-            /* vertices arrive already in camera space (the game transforms on the CPU), so the motion is in the
-               vertex positions: blend them with the matching draw of the previous frame */
-            const InV* in = (const InV*)(e + 4); int cnt = (int)e[3];
+            /* the recorded vertices are already transformed (clip space): blend their positions with the matching
+               draw of the previous frame, in screen terms, and skip the whole transform/lighting pass */
+            const OutV* in = (const OutV*)(e + 4); int cnt = (int)e[3];
             u32 key = draw_key(e); const u32* pe = prev_match(key, key_next(key));
-            const InV* use = in;
+            static OutV tmp[65536]; memcpy(tmp, in, sizeof(OutV) * (size_t)cnt);
+            static int ilog = -1; if (ilog < 0) { const char* ev = getenv("SOA_INTERPLOG"); ilog = ev ? atoi(ev) : 0; }
+            extern int g_frame_no_pub; int why = 0; float worst = 0;
             if (pe && pe[3] == e[3]) {
-                const InV* pv = (const InV*)(pe + 4); int ok = 1;
+                const OutV* pv = (const OutV*)(pe + 4); int ok = 1;
                 g_ip_dtotal++;
-                for (int i = 0; i < cnt && ok; i++) for (int k = 0; k < 3; k++) {
-                    float c = in[i].pos[k], p = pv[i].pos[k], d = fabsf(c - p), m = fmaxf(fabsf(c), fabsf(p));
-                    if (c != c || p != p || d > 8.0f + 0.25f * m) { ok = 0; break; }
+                for (int i = 0; i < cnt && ok; i++) {
+                    const OutV* c = &in[i]; const OutV* p = &pv[i];
+                    if (c->w != c->w || p->w != p->w || c->x != c->x || p->x != p->x) { ok = 0; why = 1; break; }
+                    if (c->w > 0 && p->w > 0) {   /* jump of more than ~7% of the screen: a cut or a different object (vertices behind the camera are clipped anyway) */
+                        float dx = fabsf(c->x / c->w - p->x / p->w), dy = fabsf(c->y / c->w - p->y / p->w);
+                        if (dx > worst) worst = dx; if (dy > worst) worst = dy;
+                        if (dx > 0.15f || dy > 0.15f) { ok = 0; why = 2; break; }
+                    }
                 }
                 if (ok) {
-                    static InV tmp[65536];
-                    for (int i = 0; i < cnt; i++) { tmp[i] = in[i]; for (int k = 0; k < 3; k++) { tmp[i].pos[k] = pv[i].pos[k] + (in[i].pos[k] - pv[i].pos[k]) * t; tmp[i].nrm[k] = pv[i].nrm[k] + (in[i].nrm[k] - pv[i].nrm[k]) * t; } }
-                    use = tmp; g_ip_dblend++;
+                    for (int i = 0; i < cnt; i++) { tmp[i].x = pv[i].x + (in[i].x - pv[i].x) * t; tmp[i].y = pv[i].y + (in[i].y - pv[i].y) * t; tmp[i].z = pv[i].z + (in[i].z - pv[i].z) * t; tmp[i].w = pv[i].w + (in[i].w - pv[i].w) * t; }
+                    g_ip_dblend++;
                 }
-            }
-            draw_core((int)e[1], (int)e[2], cnt, use, 0, 0); o += 16 + sizeof(InV) * e[3];
+            } else why = pe ? 3 : 4;
+            if (ilog && g_frame_no_pub == ilog && why) rt_log("interp f%d: draw sig %08X prim %u n %d not blended: %s (worst jump %.3f)\n", ilog, e[0] & 0xFFFFFF00u, e[1], cnt, why == 1 ? "nan" : why == 2 ? "jump" : why == 3 ? "count differs" : "no match", worst);
+            draw_out((int)e[1], (int)(e[2] & 0xFF), cnt, tmp, 0, 0); o += 16 + sizeof(OutV) * e[3];
         }
     }
     g_replay = 0; g_rec = rec;
@@ -1056,6 +1092,8 @@ void options_pause_loop(void) {
     }
 #endif
 }
+char g_perf_text[3][200];   /* on-screen performance readout (F3) */
+int g_perf_overlay;
 void gx_frame_done(int w, int h) {
     g_tex_epoch++;
     if (g_use_gl && !g_interp) { extern void gl_save_real(void); gl_save_real(); }   /* (interpolation saves it itself) */
@@ -1067,19 +1105,30 @@ void gx_frame_done(int w, int h) {
     if (g_interp > 0 && g_use_gl) goto presented;
     { extern u64 g_pf_present; u64 t = host_tb(); if (g_use_gl) platform_present(); g_pf_present += host_tb() - t; }
 presented:;
-    {   /* every ~5 s: frame rate and where the host time went (ms per frame) */
-        extern u64 g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle; static u64 t0, n;
-        u64 now = host_tb(); n++;
-        static u64 last, maxdt, slow;
-        if (last) { u64 dt = now - last; if (dt > maxdt) maxdt = dt; if (dt > 40500000ull * 45 / 1000) slow++; }   /* frames taking > 45 ms */
-        last = now;
-        if (!t0) t0 = now;
-        else if (now - t0 > 5ull * 40500000ull) {
-            double ms = 1000.0 / 40500000.0 / n;
-            rt_log("perf: %.1f fps | per frame ms: flush %.2f (hash %.2f, upload %.2f) readback %.2f present %.2f dc-sound %.2f idle %.2f | draws %.0f | worst frame %.1f ms, %llu over 45 ms\n", n * 40500000.0 / (now - t0),
-                   g_pf_flush * ms, g_pf_hash * ms, g_pf_upload * ms, g_pf_read * ms, g_pf_present * ms, g_pf_snd * ms, g_pf_idle * ms, (double)g_pf_draws / n, maxdt * 1000.0 / 40500000.0, (unsigned long long)slow); maxdt = 0; slow = 0;
-            t0 = now; n = 0; g_pf_hash = g_pf_flush = g_pf_read = g_pf_present = g_pf_draws = g_pf_upload = g_pf_snd = g_pf_idle = 0;
+    {   /* performance accounting: counters only grow; the 5 s log line and the 1 s on-screen readout (F3) each keep their own bases */
+        extern u64 g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle, g_pf_ccopy, g_pf_zcopy, g_pf_ztime, g_pf_xform, g_pf_verts, g_pf_upn, g_pf_upbytes;
+        typedef struct { u64 t, n, max, slow, hash, flush, read, present, draws, upload, snd, idle, ccopy, zcopy, ztime, xform, verts, upn, upbytes; } PB;
+        static PB L, S; static u64 last;
+        u64 now = host_tb();
+        u64 dt = last ? now - last : 0; last = now;
+        if (dt > L.max) L.max = dt; if (dt > S.max) S.max = dt; if (dt > 40500000ull * 45 / 1000) L.slow++;
+        L.n++; S.n++;
+        if (!L.t) L.t = now; if (!S.t) S.t = now;
+#define D(f) ((double)(g_pf_##f - B->f))
+        if (now - S.t >= 40500000ull) {   /* 1 s: on-screen text */
+            PB* B = &S; double ms = 1000.0 / 40500000.0 / S.n;
+            snprintf(g_perf_text[0], sizeof g_perf_text[0], "%.1f fps   frame %.1f ms (worst %.1f)%s", S.n * 40500000.0 / (now - S.t), (now - S.t) / 40500000.0 * 1000.0 / S.n, S.max * 1000.0 / 40500000.0, g_interp > 0 ? "   60 fps interpolation" : "");
+            snprintf(g_perf_text[1], sizeof g_perf_text[1], "cpu ms: vertices %.1f (%.0fk, %.0f draws)  gl %.1f  tex upload %.1f  sound %.1f  idle %.1f", D(xform) * ms, D(verts) / S.n / 1000.0, D(draws) / S.n, (D(flush) - D(hash) - D(upload)) * ms, D(upload) * ms, D(snd) * ms, D(idle) * ms);
+            snprintf(g_perf_text[2], sizeof g_perf_text[2], "gpu sync ms: readback %.1f  depth copies %.1f (%.1f/frame)  cpu copies %.1f/frame  tex hash %.1f", D(read) * ms, D(ztime) * ms, D(zcopy) / S.n, D(ccopy) / S.n, D(hash) * ms);
+            S = (PB){ now, 0, 0, 0, g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle, g_pf_ccopy, g_pf_zcopy, g_pf_ztime, g_pf_xform, g_pf_verts, g_pf_upn, g_pf_upbytes };
         }
+        if (now - L.t > 5ull * 40500000ull) {   /* 5 s: log line */
+            PB* B = &L; double ms = 1000.0 / 40500000.0 / L.n;
+            rt_log("perf: %.1f fps | per frame ms: vertices %.2f (%.0f verts) flush %.2f (hash %.2f, upload %.2f = %.1f textures %.0f KB) readback %.2f (cpu copies %.2f, depth copies %.2f taking %.2f ms) present %.2f dc-sound %.2f idle %.2f | draws %.0f | worst frame %.1f ms, %llu over 45 ms\n", L.n * 40500000.0 / (now - L.t),
+                   D(xform) * ms, D(verts) / L.n, D(flush) * ms, D(hash) * ms, D(upload) * ms, D(upn) / L.n, D(upbytes) / L.n / 1024.0, D(read) * ms, D(ccopy) / L.n, D(zcopy) / L.n, D(ztime) * ms, D(present) * ms, D(snd) * ms, D(idle) * ms, D(draws) / L.n, L.max * 1000.0 / 40500000.0, (unsigned long long)L.slow);
+            L = (PB){ now, 0, 0, 0, g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_snd, g_pf_idle, g_pf_ccopy, g_pf_zcopy, g_pf_ztime, g_pf_xform, g_pf_verts, g_pf_upn, g_pf_upbytes };
+        }
+#undef D
     }
     dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
     {   /* SOA_RAMDUMP=f1,f2,...: write main RAM to frames/ram_F.bin at those XFB frames */

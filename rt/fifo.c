@@ -100,7 +100,22 @@ static size_t parse(const u8* p, size_t n, int depth) {
 
 static u8 g_buf[1 << 22]; static size_t g_len;
 void fifo_debug(void) { fprintf(stderr, "fifo pending %zu bytes:", g_len); for (size_t i = 0; i < g_len && i < 48; i++) fprintf(stderr, " %02X", g_buf[i]); fprintf(stderr, "\n"); if (g_len >= 3 && g_buf[0] >= 0x80) fprintf(stderr, "  draw op %02X count %d vsize %d\n", g_buf[0], g_buf[1] << 8 | g_buf[2], gx_vertex_size(g_buf[0] & 7)); }
+/* The write-gather pipe feeds the CPU FIFO described by the PI registers. Normally that is the same memory as the
+   GP FIFO (CP registers) and the GPU consumes it, so the commands are parsed straight away. While a display list is
+   being recorded (GXBeginDisplayList), the SDK points the CPU FIFO at the list's buffer instead: then the bytes
+   only land in RAM, to be executed when the game calls the list (opcode 0x40) - this is how the game defers its
+   translucent passes to the end of the frame. */
+u64 g_dl_recorded;
 void fifo_write(u32 v, int size) {
+    { u32 hw_reg32(u32); void hw_reg32_set(u32, u32); u16 hw_reg16(u32);
+      u32 pib = hw_reg32(0x300C) & 0x03FFFFE0u, cpb = ((u32)hw_reg16(0x20) | (u32)hw_reg16(0x22) << 16) & 0x03FFFFE0u;
+      if (pib && pib != cpb) {
+          u32 wr = hw_reg32(0x3014), a = wr & 0x03FFFFFFu;
+          for (int k = size - 1; k >= 0; k--) { if ((a & 0x01FFFFFF) < RAM_SIZE) g_ram[a & 0x01FFFFFF] = (u8)(v >> (8 * k)); a++; }
+          hw_reg32_set(0x3014, (wr & ~0x03FFFFFFu) | (a & 0x03FFFFFFu));
+          g_dl_recorded += size;
+          return;
+      } }
     if (g_len + 4 > sizeof g_buf) g_len = 0;
     for (int k = size - 1; k >= 0; k--) g_buf[g_len++] = (u8)(v >> (8 * k));
     g_fifo_bytes += size;

@@ -92,6 +92,9 @@ WEAK void platform_pump(void) {
     }
     si_set_pad(b0 << 24 | b1 << 16 | sx << 8 | sy, 0x80800000u);
 }
+static int g_idle_now;          /* rt_poll called from the idle loop: the game is waiting */
+int g_vi_wait;                  /* a thread is inside VIWaitForRetrace */
+int g_vi_defer_max = 0;         /* retrace held back while the game is busy, up to this many fields (SOA_VIDEFER) */
 void rt_poll(Ctx* c) {
     g_poll_ctr = 2000;
     u64 now = host_tb();
@@ -99,10 +102,20 @@ void rt_poll(Ctx* c) {
       if (limit && now > limit) { extern u64 g_irq_counts[16], g_fifo_bytes, g_draws, g_tris; extern int g_frame_no_pub;
         fprintf(stderr, "exit after %llus: vi %llu xfb %d fifo %llu draws %llu tris %llu\n", (unsigned long long)(limit / TB_RATE), (unsigned long long)g_frames, g_frame_no_pub, (unsigned long long)g_fifo_bytes, (unsigned long long)g_draws, (unsigned long long)g_tris); exit(0); } }
     if (!g_next_vi) g_next_vi = now + g_vi_period;
-    if ((s64)(now - g_next_vi) >= 0) {
-        g_next_vi += g_vi_period;
-        if ((s64)(now - g_next_vi) > (s64)(g_vi_period * 4)) g_next_vi = now + g_vi_period; /* don't spiral */
+    /* The retrace interrupt is only taken while the game is idle (waiting for it), unless it is badly overdue.
+       The game draws part of its frame (translucent effects, the cloth and sparkle passes) in response to the
+       retrace; when a frame takes longer than a field and the retrace lands in the middle of it, those passes end
+       up under the scenery drawn afterwards. Holding the retrace until the frame is finished keeps the console's
+       order when the host cannot keep up, at the cost of the game slowing down rather than dropping fields. */
+    { static int init; if (!init) { init = 1; const char* e = getenv("SOA_VIDEFER"); if (e) g_vi_defer_max = atoi(e); } }
+    extern u64 g_vi_poll_tb;
+    { static int logged; if (logged < 3 && (s64)(now - g_next_vi) >= (s64)(g_vi_period * 10) && !g_idle_now && !g_vi_wait && (s64)(now - g_vi_poll_tb) >= (s64)(TB_RATE / 500)) { logged++; extern void rt_backtrace(Ctx*); rt_log("VI held %d periods; game busy in thread %08X msr %08X:\n", (int)((now - g_next_vi) / g_vi_period), R32(0x800000E4), c->msr); rt_backtrace(c); } }
+    int waiting = g_idle_now || g_vi_wait || (s64)(now - g_vi_poll_tb) < (s64)(TB_RATE / 500);   /* idle, in VIWaitForRetrace, or polling the retrace count */
+    if ((s64)(now - g_next_vi) >= 0 && (waiting || (s64)(now - g_next_vi) >= (s64)(g_vi_period * (u64)g_vi_defer_max))) {
+        if ((s64)(now - g_next_vi) >= (s64)g_vi_period) g_next_vi = now + g_vi_period; /* late: resync rather than catch up */
+        else g_next_vi += g_vi_period;
         g_frames++;
+        { extern int g_dbgf, g_frame_no_pub, g_dbg_draw_no; if (g_dbgf && g_frame_no_pub == g_dbgf) rt_log("VI delivered after draw %d (waiting=%d idle=%d viwait=%d)\n", g_dbg_draw_no, waiting, g_idle_now, g_vi_wait); }
         { extern void platform_pump(void); platform_pump(); }
         vi_retrace_event();
         { extern void interp_vi(void); interp_vi(); }
@@ -111,11 +124,16 @@ void rt_poll(Ctx* c) {
         { extern int vi_refresh_hz(void); static int hz = 50; int nh = vi_refresh_hz(); if (nh != hz) { hz = nh; g_vi_period = TB_RATE / hz; rt_log("VI: %d Hz\n", hz); } }
     }
     hw_tick();
+    { extern void pe_commit(void); pe_commit(); }
     deliver(c);
+    /* an interrupt that is pending but masked (EE off) must be taken as soon as the game re-enables interrupts, not
+       up to 2000 loop iterations later: keep polling often while that is the case */
+    if (!g_in_irq && !(c->msr & 0x8000u) && (pi_intsr() & R32(0xCC003004))) g_poll_ctr = 8;
 }
 
 /* called from the OS idle loop: sleep until the next event, then deliver */
 void rt_idle(Ctx* c) {
+    g_idle_now = 1;
     rt_poll(c);
     u64 now = host_tb();
     u64 next = g_next_vi;
@@ -136,4 +154,5 @@ void rt_idle(Ctx* c) {
         g_pf_idle += host_tb() - t0;
     }
     rt_poll(c);
+    g_idle_now = 0;
 }

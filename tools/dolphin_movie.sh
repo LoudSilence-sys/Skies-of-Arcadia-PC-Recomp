@@ -10,7 +10,7 @@ mkdir -p "$3"; rm -f $FR/framedump_*.png
 EGL_PLATFORM=surfaceless timeout $4 $D -u $U -p headless -v OGL \
   -C Dolphin.Interface.UsePanicHandlers=False -C Dolphin.DSP.Backend=Null -C Dolphin.Core.EmulationSpeed=0 \
   -C Dolphin.Core.SlotA=1 -C Dolphin.Core.MemcardAPath="$2" \
-  -C GFX.Settings.DumpFramesAsImages=True -C Dolphin.Movie.DumpFrames=True \
+  -C Graphics.Settings.DumpFramesAsImages=True -C Graphics.Settings.FrameDumpsResolutionType=2 -C Dolphin.Movie.DumpFrames=True \
   -m "$1" -e "/home/claude/game/SOA Legends/sys/main.dol" >/tmp/dolphin_movie.log 2>&1 &
 P=$!
 while kill -0 $P 2>/dev/null; do

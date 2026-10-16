@@ -46,6 +46,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: g_win_w = LOWORD(l); g_win_h = HIWORD(l); return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (w == VK_F1) { extern void options_toggle(void); if (!(l & (1 << 30))) options_toggle(); return 0; }
+        if (w == VK_F3) { extern int g_perf_overlay; if (!(l & (1 << 30))) g_perf_overlay = !g_perf_overlay; return 0; }   /* performance readout */
         if (w == VK_F11 || (w == VK_RETURN && (l & (1 << 29)))) { if (!(l & (1 << 30))) set_fullscreen(!g_fullscreen); return 0; }   /* F11 / Alt+Enter */
         g_keys[w & 255] = 1; return 0;
     case WM_KEYUP: case WM_SYSKEYUP: g_keys[w & 255] = 0; return 0;

@@ -20,6 +20,7 @@ def main():
     off = 0x89
     h[off + 14] = 1      # memcards
     h[off + 15] = 0      # bClearSave
+    struct.pack_into('<Q', h, 0xED, 1 << 62)   # tickCount: playback ends when the emulated clock passes this, so keep it far away
     body = bytearray()
     for k in range(n):
         bits = 1 << 14   # is_connected

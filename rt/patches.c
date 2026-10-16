@@ -16,8 +16,27 @@ static int g_fps60 = -1;
 void f_80240B24(Ctx* c) {   /* VIWaitForRetrace */
     if (g_fps60 < 0) { g_fps60 = settings_get("unlock_framerate", 0); if (getenv("SOA_FPS60")) g_fps60 = atoi(getenv("SOA_FPS60")); if (g_fps60) rt_log("patch: 60 fps frame pacing\n"); }
     if (g_fps60 && c->lr == 0x801DE168) return;   /* end-of-frame wait in the main loop */
-    r_80240B24(c);
+    { extern int g_vi_wait; g_vi_wait++; r_80240B24(c); g_vi_wait--; }   /* the game is waiting for the retrace: it may be delivered now (sched.c) */
 }
+
+/* The main loop's first retrace wait is a busy poll of VIGetRetraceCount (0x801DE128): tell the scheduler the game is
+   waiting (sched.c holds the retrace back while the game is busy) */
+void r_80241DC8(Ctx* c);
+u64 g_vi_poll_tb;
+void f_80241DC8(Ctx* c) {   /* VIGetRetraceCount */
+    if (c->lr == 0x801DE128) { extern u64 host_tb(void); g_vi_poll_tb = host_tb(); }
+    r_80241DC8(c);
+}
+
+/* debugging: log the object draw dispatch (SOA_DBGOBJ=frame) */
+void r_80118FAC(Ctx* c); void r_80119054(Ctx* c);
+extern int g_frame_no_pub;
+static void objlog(Ctx* c, const char* who) {
+    static int f = -1; if (f < 0) { const char* e = getenv("SOA_DBGOBJ"); f = e ? atoi(e) : 0; }
+    if (f && g_frame_no_pub == f) { u32 o = c->r[3]; rt_log("obj %s lr %08X obj %08X +190 %f +1a8 %f +19c %08X +e4 %08X +184 %08X sp %08X\n", who, c->lr, o, RF32(o + 0x190), RF32(o + 0x1a8), R32(o + 0x19c), R32(o + 0xe4), R32(o + 0x184), c->r[1]); }
+}
+void f_80118FAC(Ctx* c) { objlog(c, "A"); r_80118FAC(c); }
+void f_80119054(Ctx* c) { objlog(c, "B"); r_80119054(c); }
 
 /* ---------------- title screen: third menu entry "Options" ----------------
    The title menu (state at [0x8034AD7C]) was built for the Dreamcast's three entries (New Game, Continue,

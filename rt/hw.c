@@ -17,6 +17,9 @@ static u16 g_mmio_cnt[0x10000];
 #define R16REG(off) g_r16[((off) & 0xFFFF) >> 1]
 static u32 r32reg(u32 off) { return (u32)R16REG(off) << 16 | R16REG(off + 2); }
 static void w32reg(u32 off, u32 v) { R16REG(off) = (u16)(v >> 16); R16REG(off + 2) = (u16)v; }
+u32 hw_reg32(u32 off) { return r32reg(off); }
+void hw_reg32_set(u32 off, u32 v) { w32reg(off, v); }
+u16 hw_reg16(u32 off) { return R16REG(off); }
 
 /* ======================= disc ======================= */
 typedef struct { u32 off, size; char* path; } DiscFile;
@@ -385,9 +388,20 @@ u32 pi_intsr(void) {
     return s;
 }
 
-void pe_finish(void) { R16REG(0x100A) |= 0x8; }
-void pe_token(u16 t) { R16REG(0x100E) = t; R16REG(0x100A) |= 0x4; }
-void pe_token_noirq(u16 t) { R16REG(0x100E) = t; }
+extern int g_poll_ctr;
+/* PE draw-sync tokens and draw-done: the GPU reaches them some time after the CPU writes them, and the token
+   register and the interrupt appear together at that moment. Games lean on this ordering: this one draws a late
+   pass (the ship's sail, effects) from the token callback and copies the frame out afterwards, waiting on the
+   token register in between. So the register keeps its old value until the interrupt is actually delivered,
+   which the next poll does right away (g_poll_ctr = 0: the next loop back-edge). */
+static int g_pe_pend_fin, g_pe_pend_tok; static u16 g_pe_tok;
+void pe_finish(void) { g_pe_pend_fin = 1; g_poll_ctr = 0; }
+void pe_token(u16 t) { g_pe_tok = t; g_pe_pend_tok = 2; g_poll_ctr = 0; }
+void pe_token_noirq(u16 t) { g_pe_tok = t; if (!g_pe_pend_tok) g_pe_pend_tok = 1; g_poll_ctr = 0; }
+void pe_commit(void) {   /* called at every poll before interrupts are delivered */
+    if (g_pe_pend_tok) { R16REG(0x100E) = g_pe_tok; if (g_pe_pend_tok == 2) R16REG(0x100A) |= 0x4; g_pe_pend_tok = 0; }
+    if (g_pe_pend_fin) { R16REG(0x100A) |= 0x8; g_pe_pend_fin = 0; }
+}
 
 u64 hw_pad_reads(void);
 int ai_dma_tick(int rate, u16* csr);
