@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* pcfeat.c - PC-port features that are independent of the game code:
    - custom texture packs in Dolphin's format (Load/Textures/GEAP8P or GEA, .png or .dds, names from Dolphin)
    - on-screen messages

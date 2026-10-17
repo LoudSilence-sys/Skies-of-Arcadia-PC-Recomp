@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   The TEV/fog/indirect shader, blend state derivation and EFB-copy encoders are ported from Dolphin's VideoCommon (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 /* gl_backend.c - OpenGL 3.3 renderer for the GX pipeline.
    Vertices are transformed/lit/clipped on the CPU (gx.c); the GPU rasterizes and runs the TEV
    as a single "uber" fragment shader driven by the raw BP register words. */

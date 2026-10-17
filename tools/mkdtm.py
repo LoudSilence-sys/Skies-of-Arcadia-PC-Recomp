@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 """mkdtm.py - write a Dolphin input movie (.dtm) from a press script, for reference captures.
 usage: mkdtm.py out.dtm NINPUTS "idx:button:len,idx:button:len,..."
 buttons: start a b x y z up down left right l r   (up/down/left/right = main stick)

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   Low-memory boot setup mirrors Dolphin's CBoot::SetupGCMemory (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 #define _GNU_SOURCE
 /* runtime.c - host side of the recompiled Skies of Arcadia Legends */
 #include "rt.h"
@@ -139,17 +143,50 @@ void PSQ_ST(Ctx* c, int fs, u32 ea, int w, int i) {
 }
 
 /* ---------------- boot ---------------- */
-extern const u8 soa_dol_blob[];
+/* The executable holds only the translated code; the game's own main.dol supplies the data sections at start-up.
+   It must be the exact image the code was translated from (PAL GEAP8P, SHA-1 below). */
+#define DOL_SHA1 "295a9fc982072bce60734eb6bdb60aec4182b702"
+static void sha1(const u8* d, u64 n, char out[41]) {
+    u32 h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    u64 bits = n * 8, total = ((n + 8) / 64 + 1) * 64;
+    for (u64 blk = 0; blk < total; blk += 64) {
+        u8 b[64];
+        for (int i = 0; i < 64; i++) {
+            u64 k = blk + i;
+            b[i] = k < n ? d[k] : k == n ? 0x80 : k >= total - 8 ? (u8)(bits >> (8 * (total - 1 - k))) : 0;
+        }
+        u32 w[80];
+        for (int i = 0; i < 16; i++) w[i] = (u32)b[4 * i] << 24 | (u32)b[4 * i + 1] << 16 | (u32)b[4 * i + 2] << 8 | b[4 * i + 3];
+        for (int i = 16; i < 80; i++) { u32 x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]; w[i] = x << 1 | x >> 31; }
+        u32 a = h[0], bb = h[1], c = h[2], dd = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            u32 f, k;
+            if (i < 20) { f = (bb & c) | (~bb & dd); k = 0x5A827999; } else if (i < 40) { f = bb ^ c ^ dd; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (bb & c) | (bb & dd) | (c & dd); k = 0x8F1BBCDC; } else { f = bb ^ c ^ dd; k = 0xCA62C1D6; }
+            u32 t = (a << 5 | a >> 27) + f + e + k + w[i]; e = dd; dd = c; c = bb << 30 | bb >> 2; bb = a; a = t;
+        }
+        h[0] += a; h[1] += bb; h[2] += c; h[3] += dd; h[4] += e;
+    }
+    for (int i = 0; i < 5; i++) snprintf(out + 8 * i, 9, "%08x", h[i]);
+}
 static void load_dol(const char* path, u32* entry) {
-    (void)path; const u8* d = soa_dol_blob;   /* the exact image the code was recompiled from */
+    FILE* f = fopen(path, "rb");
+    if (!f) rt_fatal("Cannot open %s.\nPoint game_path.txt at your extracted Skies of Arcadia Legends (PAL) folder.\n", path);
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    u8* d = malloc(n > 0 ? n : 1); if (n < 0x100 || fread(d, 1, n, f) != (size_t)n) rt_fatal("Cannot read %s.\n", path);
+    fclose(f);
+    char h[41]; sha1(d, (u64)n, h);
+    if (strcmp(h, DOL_SHA1)) rt_fatal("%s is not the executable this build was made from.\nThis build needs Skies of Arcadia Legends, PAL (GEAP8P), unmodified.\nSHA-1 found:    %s\nSHA-1 expected: %s\n", path, h, DOL_SHA1);
     #define BE(o) ((u32)d[o] << 24 | (u32)d[(o)+1] << 16 | (u32)d[(o)+2] << 8 | d[(o)+3])
     u32 bss = BE(0xD8), bsz = BE(0xDC);
     memset(g_ram + (bss & 0x01FFFFFF), 0, bsz);   /* header BSS range overlaps .sdata/.sdata2: clear first */
     for (int i = 0; i < 18; i++) {
         u32 off = BE(i * 4), addr = BE(0x48 + i * 4), sz = BE(0x90 + i * 4);
-        if (sz) memcpy(g_ram + (addr & 0x01FFFFFF), d + off, sz);
+        if (sz && off + sz <= (u32)n) memcpy(g_ram + (addr & 0x01FFFFFF), d + off, sz);
     }
     *entry = BE(0xE0);
+    #undef BE
+    free(d);
 }
 
 static void setup_lowmem(void) {

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* options.c - the options screen: opened from the title menu's "Options" entry or with F1 at any time.
    Drawn by the renderer over the game in the style of the game's own windows, in five pages (Display,
    Graphics, Gameplay, Audio, Controls).  Changes apply immediately where possible and are saved to

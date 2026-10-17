@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* glmini.h - the small subset of OpenGL 3.3 core we use, loaded at runtime */
 #pragma once
 #include <stdint.h>

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 """framecmp.py REFDIR OURDIR [window] - match each Dolphin frame to the closest recomp frame (by index
 window), report the worst matches. Frames are downscaled to 160x120 grayscale+color for robustness."""
 import sys, os, re, numpy as np

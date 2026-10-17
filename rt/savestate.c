@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* savestate.c - quick save / quick load (F5 / F9, slot with F6 / F7).
 
    The game is statically recompiled, so the host C stack mirrors the guest call stack.  A state can only

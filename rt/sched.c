@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* sched.c - timed hardware events and interrupt delivery at safe points */
 #include "funcs.h"
 #include "names.h"

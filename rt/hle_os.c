@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* hle_os.c - native replacements for SDK functions (strong symbols override the weak recompiled ones) */
 #include "funcs.h"
 #include "names.h"

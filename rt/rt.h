@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* rt.h - runtime model for recompiled Gekko code */
 #pragma once
 #include <stdint.h>

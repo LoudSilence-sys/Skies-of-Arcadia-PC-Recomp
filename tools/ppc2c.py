@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 """
 ppc2c.py - static recompiler: Gekko/PowerPC DOL -> C.
 
@@ -550,4 +552,9 @@ class Recomp:
         print('entries', len(ents), 'files', nfile, 'unimplemented', dict(self.unimpl))
 
 if __name__ == '__main__':
+    if len(sys.argv) != 4: sys.exit('usage: ppc2c.py main.dol config/GEAP8P/symbols.txt OUTDIR')
+    import hashlib
+    h = hashlib.sha1(open(sys.argv[1], 'rb').read()).hexdigest()
+    if h != '295a9fc982072bce60734eb6bdb60aec4182b702':
+        sys.exit('%s has SHA-1 %s; this project needs the unmodified PAL main.dol (GEAP8P, 295a9fc9...)' % (sys.argv[1], h))
     Recomp(sys.argv[1], sys.argv[2]).run(sys.argv[3])

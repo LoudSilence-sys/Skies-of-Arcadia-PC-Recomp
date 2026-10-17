@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   The memory card device is ported from Dolphin's CEXIMemoryCard and MemoryCard code; other hardware behaviour is checked against Dolphin (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 /* hw.c - hardware register model: VI, PI, DI (disc), EXI, SI, AI/DSP, CP/PE + GX FIFO parsing */
 #include "rt.h"
 #include <stdio.h>

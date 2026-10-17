@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 """mkcard.py - build a formatted GameCube memory card image (.raw) and optionally import .gci saves.
 usage: mkcard.py out.raw [save1.gci ...]
 Card: 251 blocks (16 Mbit), ANSI encoding, flash ID all zero (the runtime derives the SRAM flash ID from the header)."""

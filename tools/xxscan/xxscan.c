@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors */
 /* xxscan FILE SIZE STEP HASH... : find 32-byte-aligned windows of SIZE bytes whose XXH64 (seed 0) matches
    one of the given hashes (Dolphin's dumped-texture names). */
 #define XXH_INLINE_ALL

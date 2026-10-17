@@ -18,3 +18,17 @@ dc_path.txt
 rt.log
 prof.txt
 *.png
+*.gci
+*.sav
+*.sct
+*.bin
+*.zip
+*.dll
+*.log
+States/
+ScreenShots/
+Load/
+Dump/
+settings.ini
+tools/xxscan/xxscan
+tools/aklz

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   Ported from Dolphin's DSPHLE AX implementation (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 /* ax.c - AX audio microcode (CRC 4e8a8b21, used by MusyX here), ported to C from Dolphin's
    DSPHLE AX implementation (GPL-2.0-or-later), plus AI DMA timing and host audio output. */
 #include "rt.h"

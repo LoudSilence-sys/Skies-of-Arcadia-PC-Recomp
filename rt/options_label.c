@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later (code); the embedded image is text rendered with Almendra Bold, SIL OFL 1.1 (see licenses/OFL-1.1.txt)
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* options_label.c - "Options" labels in the style of the title menu, rendered with Almendra Bold (SIL Open Font License):
    g_options_label 156x40 RGBA (title menu entry), g_options_title 312x80 RGBA (options screen heading) */
 const unsigned char g_options_label[24960] = {

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 import subprocess, bisect, collections, sys
 syms = []
 for l in subprocess.run(['nm', '-n', '--defined-only', sys.argv[1] if len(sys.argv) > 1 else 'soa'], capture_output=True, text=True).stdout.splitlines():

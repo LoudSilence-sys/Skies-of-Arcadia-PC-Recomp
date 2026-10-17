@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* patches.c - game-specific behaviour changes for the PC port (enhancements), as overrides of recompiled functions.
  *
  * Frame pacing: the main loop (fn_801DE0AC, called once per game frame) waits until at least one retrace has

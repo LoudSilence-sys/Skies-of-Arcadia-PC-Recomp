@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* dcsnd.c - Dreamcast sound for the PC port.
  *
  * The GameCube game asks MusyX to play sequences (music and every sequenced sound effect) through a small

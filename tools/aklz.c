@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors */
 /* aklz.c - AKLZ (Sega LZSS) decompressor: aklz in out */
 #include <stdio.h>
 #include <stdlib.h>

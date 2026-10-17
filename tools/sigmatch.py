@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 """sigmatch.py OBJDIR... -> match reference functions (from MWCC .o files) against the DOL.
 Relocated instruction fields are masked on both sides. Output: addr name (unique matches only)."""
 import struct, sys, os, re, glob, collections

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* pc.h - PC-port features shared between runtime files (not included by the generated game code) */
 #pragma once
 #ifndef WEAK

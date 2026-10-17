@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   Texture decoding, lighting, TEV/EFB-copy semantics and texture naming follow Dolphin (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 /* gx.c - software implementation of the GameCube GPU (Flipper) fed by fifo.c
    Scope (v1): vertex decode (direct + indexed), XF transform/projection/viewport, lighting (diffuse,
    attenuation), texgen (regular + post), textures (all main formats + TLUT), TEV (full combiner incl.

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+   Command-processor behaviour follows Dolphin's OpcodeDecoding/CPMemory (GPL-2.0-or-later, https://github.com/dolphin-emu/dolphin).
+*/
 /* fifo.c - GX command stream parser (write-gather pipe at 0xCC008000 + display lists) */
 #include "rt.h"
 #include <stdio.h>

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LoudSilence-sys and contributors
 import struct,sys
 def walk(F):
     n=struct.unpack_from('>I',F,8)[0]; st=12*n; out={}; idx=[]

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* win32.c - Windows platform layer: window + WGL OpenGL 3.3 context, presentation, keyboard/XInput input */
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN

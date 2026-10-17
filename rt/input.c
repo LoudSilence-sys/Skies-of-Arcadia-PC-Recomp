@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* input.c - keyboard and controller bindings (remappable from the options screen, stored in settings.ini).
    The platform layer reports raw keyboard state (virtual-key codes) and XInput button/axis state; this file turns
    them into the GameCube pad state, plus the PC-only actions (fast-forward). */

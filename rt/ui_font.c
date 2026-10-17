@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later (code); the embedded glyphs are DejaVu Sans Bold, Bitstream Vera license (see licenses/DejaVu-fonts.txt)
+   Copyright (C) 2026 LoudSilence-sys and contributors
+*/
 /* ui_font.c - options-screen font atlas: DejaVu Sans Bold 26 px (Bitstream Vera license), ASCII 32-126, 16 x 6 cells of 34 x 34 */
 const int g_uifont_cw = 34, g_uifont_ch = 34, g_uifont_cols = 16, g_uifont_w = 544, g_uifont_h = 204;
 const unsigned char g_uifont_adv[95] = {9,12,14,22,18,26,23,8,12,12,14,22,10,11,10,10,18,18,18,18,18,18,18,18,18,18,10,10,22,22,22,15,26,20,20,19,22,18,18,21,22,10,10,20,17,26,22,22,19,22,20,19,18,21,20,29,20,19,19,12,10,12,22,13,13,18,19,15,19,18,11,19,19,9,9,17,9,27,19,18,19,19,13,15,12,19,17,24,17,17,15,19,10,19,22};
