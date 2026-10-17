@@ -355,6 +355,12 @@ int options_is_open(void);
 /* what the game sees: nothing while the options screen has the controller */
 static u32 pad_hi(void) { return options_is_open() ? 0x00808080u : g_pad_hi; }
 static u32 pad_lo(void) { return options_is_open() ? 0x80800000u : g_pad_lo; }
+/* controller rumble: the poll command's low bits (1 = motor on, 2 = hard stop) */
+WEAK void platform_rumble(int on) { (void)on; }
+static void rumble_update(u32 m) {
+    static int cur = -1; int on = m == 1 && !options_is_open();
+    if (on != cur) { cur = on; platform_rumble(on); static int n; if (n++ < 20) rt_log("rumble %s\n", on ? "on" : "off"); }
+}
 static void si_transfer(u32 csr) {
     int chn = (csr >> 1) & 3;
     u8 buf[128]; for (int i = 0; i < 128; i += 2) { u16 w = R16REG(0x6480 + i); buf[i] = w >> 8; buf[i + 1] = (u8)w; }
@@ -363,7 +369,7 @@ static void si_transfer(u32 csr) {
     if (chn != 0) { w32reg(0x6438, r32reg(0x6438) | (8u << (24 - 8 * chn))); goto fin; }   /* NOREP on other ports */
     if (cmd == 0x00 || cmd == 0xFF) { out[0] = 0x09; out[1] = 0x00; out[2] = 0x00; n = 3; }
     else if (cmd == 0x41 || cmd == 0x42) { u8 o[10] = {0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x1F, 0x1F, 0, 0}; memcpy(out, o, 10); n = 10; }
-    else if (cmd == 0x40) { u32 h = pad_hi(), l = pad_lo(); u8 o[8] = {h >> 24, h >> 16, h >> 8, h, l >> 24, l >> 16, l >> 8, l}; memcpy(out, o, 8); n = 8; }
+    else if (cmd == 0x40) { rumble_update(buf[2] & 3); u32 h = pad_hi(), l = pad_lo(); u8 o[8] = {h >> 24, h >> 16, h >> 8, h, l >> 24, l >> 16, l >> 8, l}; memcpy(out, o, 8); n = 8; }
     for (int i = 0; i < n; i += 2) R16REG(0x6480 + i) = (u16)(out[i] << 8 | (i + 1 < n ? out[i + 1] : 0));
 fin:
     g_si_done_at = host_tb() + 40500000ull / 2000;   /* ~0.5 ms per transfer */
@@ -463,7 +469,7 @@ u32 mmio_read(u32 a, int size) {
     if (off == 0x3000) { v = pi_intsr(); goto done; }
     if (off == 0x6800) { sram_init(); mc_init(); if (g_mc_on) w32reg(0x6800, r32reg(0x6800) | 0x1000u); }
     if (off == 0x5016) { v = 1; goto done; }    /* ARAM ready */
-    if (off == 0x6404) { static u64 nr, np; nr++; if (g_pad_hi >> 24) { if (np++ < 5) rt_log("pad read with buttons %08X (read #%llu)\n", g_pad_hi, (unsigned long long)nr); } v = pad_hi(); w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); w32reg(0x6438, r32reg(0x6438) & ~0x20000000u); goto done; }
+    if (off == 0x6404) { rumble_update(r32reg(0x6400) & 3); static u64 nr, np; nr++; if (g_pad_hi >> 24) { if (np++ < 5) rt_log("pad read with buttons %08X (read #%llu)\n", g_pad_hi, (unsigned long long)nr); } v = pad_hi(); w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); w32reg(0x6438, r32reg(0x6438) & ~0x20000000u); goto done; }
     if (off == 0x6408) { v = pad_lo(); goto done; }
     if (off == 0x6410 || off == 0x641C || off == 0x6428) { v = 0x80000000u; w32reg(0x6434, r32reg(0x6434) & ~0x10000000u); goto done; }   /* ports 2-4: no controller */
     if (off == 0x5004 && size == 2) { v = g_dsp_out_n ? (0x8000 | (g_dsp_out[0] >> 16)) : 0; goto done; }
@@ -524,4 +530,124 @@ void hw_state(SS* s) {
     SSV(s, g_mc_done_pending); ss_time(s, &g_mc_done_at);
     SSV(s, g_pe_pend_fin); SSV(s, g_pe_pend_tok); SSV(s, g_pe_tok);
     SSV(s, g_dsp_out); SSV(s, g_dsp_out_n); SSV(s, g_dsp_boot_stage); SSV(s, g_dsp_in_hi);
+}
+int sram_language(void) { sram_init(); return g_sram[0x12]; }   /* PAL: 0 English, 1 German, 2 French, 3 Spanish, 4 Italian, 5 Dutch */
+
+/* ---------------- memory card manager (options: Memory Card page) ----------------
+   Lists the saves on MemoryCardA.raw, exports them as .gci (Dolphin's format) into the GCI folder, imports
+   .gci files from it, deletes saves and backs up the whole card. Both directory and allocation-table copies
+   are rewritten with a newer update counter, as the CARD library does. Not to be used while the game has the
+   card open (its save/load screens). */
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
+static u16 be16p(const u8* p) { return (u16)(p[0] << 8 | p[1]); }
+static void wbe16(u8* p, u16 v) { p[0] = v >> 8; p[1] = (u8)v; }
+static int mc_active(int a, int b) {   /* the copy (block a or b) with the newer update counter and a good checksum */
+    u8 ck[4]; int okA, okB; u32 off = a == 1 ? 0x1FFA : 4;
+    if (a == 1) { mc_csum(g_mc + 0x2000, 0x1FFC, ck); okA = !memcmp(ck, g_mc + 0x2000 + 0x1FFC, 4); mc_csum(g_mc + 0x4000, 0x1FFC, ck); okB = !memcmp(ck, g_mc + 0x4000 + 0x1FFC, 4); }
+    else { mc_csum(g_mc + 0x6000 + 4, 0x1FFC, ck); okA = !memcmp(ck, g_mc + 0x6000, 4); mc_csum(g_mc + 0x8000 + 4, 0x1FFC, ck); okB = !memcmp(ck, g_mc + 0x8000, 4); }
+    if (okA && !okB) return a; if (okB && !okA) return b;
+    s16 ua = (s16)be16p(g_mc + a * 0x2000 + off), ub = (s16)be16p(g_mc + b * 0x2000 + off);
+    return (s16)(ub - ua) > 0 ? b : a;
+}
+int mc_list(char names[][48], int* blocks, int max, int* free_blocks) {
+    mc_init(); if (!g_mc_on) return -1;
+    u8* dir = g_mc + mc_active(1, 2) * 0x2000; u8* bat = g_mc + mc_active(3, 4) * 0x2000;
+    int n = 0;
+    for (int i = 0; i < 127 && n < max; i++) {
+        u8* e = dir + i * 0x40; if (e[0] == 0xFF) continue;
+        char fn[33]; memcpy(fn, e + 8, 32); fn[32] = 0;
+        snprintf(names[n], 48, "%.4s %s", (const char*)e, fn); blocks[n] = be16p(e + 0x38); n++;
+    }
+    *free_blocks = be16p(bat + 6);
+    return n;
+}
+static int mc_entry_index(int k) {   /* k-th used directory entry */
+    u8* dir = g_mc + mc_active(1, 2) * 0x2000;
+    for (int i = 0; i < 127; i++) if (dir[i * 0x40] != 0xFF && k-- == 0) return i;
+    return -1;
+}
+static void mc_commit(const u8* dir, const u8* bat) {   /* write both copies, newest counter */
+    int ad = mc_active(1, 2), ab = mc_active(3, 4);
+    u16 ud = (u16)(be16p(g_mc + ad * 0x2000 + 0x1FFA) + 1), ub = (u16)(be16p(g_mc + ab * 0x2000 + 4) + 1);
+    for (int k = 0; k < 2; k++) {
+        int db = ad == 1 ? (k ? 1 : 2) : (k ? 2 : 1), bb = ab == 3 ? (k ? 3 : 4) : (k ? 4 : 3);   /* the inactive copy first */
+        u8* d = g_mc + db * 0x2000; memcpy(d, dir, 0x2000); wbe16(d + 0x1FFA, (u16)(ud + k)); mc_csum(d, 0x1FFC, d + 0x1FFC);
+        u8* b = g_mc + bb * 0x2000; memcpy(b, bat, 0x2000); wbe16(b + 4, (u16)(ub + k)); mc_csum(b + 4, 0x1FFC, b);
+    }
+    mc_flush(0x2000, 0x8000);
+}
+int mc_export(int k, char* out, int cap) {
+    mc_init(); int i = mc_entry_index(k); if (i < 0) return 0;
+    u8* dir = g_mc + mc_active(1, 2) * 0x2000; u8* bat = g_mc + mc_active(3, 4) * 0x2000; u8* e = dir + i * 0x40;
+    int n = be16p(e + 0x38); u16 blk = be16p(e + 0x36);
+#ifdef _WIN32
+    mkdir("GCI");
+#else
+    mkdir("GCI", 0755);
+#endif
+    char fn[33]; memcpy(fn, e + 8, 32); fn[32] = 0; for (char* q = fn; *q; q++) if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' || *q == '?' || *q == '"' || *q == '<' || *q == '>' || *q == '|') *q = '_';
+    snprintf(out, cap, "GCI/%.2s-%.4s-%s.gci", (const char*)e + 4, (const char*)e, fn);
+    FILE* f = fopen(out, "wb"); if (!f) return 0;
+    fwrite(e, 1, 0x40, f);
+    for (int b = 0; b < n; b++) {
+        if (blk < 5 || blk * 0x2000u >= g_mc_size) { fclose(f); return 0; }
+        fwrite(g_mc + blk * 0x2000, 1, 0x2000, f);
+        blk = be16p(bat + 0xA + 2 * (blk - 5));
+    }
+    fclose(f); return 1;
+}
+int mc_delete(int k) {
+    mc_init(); int i = mc_entry_index(k); if (i < 0) return 0;
+    u8 dir[0x2000], bat[0x2000]; memcpy(dir, g_mc + mc_active(1, 2) * 0x2000, 0x2000); memcpy(bat, g_mc + mc_active(3, 4) * 0x2000, 0x2000);
+    u8* e = dir + i * 0x40; int n = be16p(e + 0x38); u16 blk = be16p(e + 0x36);
+    for (int b = 0; b < n && blk >= 5; b++) { u16 nx = be16p(bat + 0xA + 2 * (blk - 5)); wbe16(bat + 0xA + 2 * (blk - 5), 0); blk = nx; }
+    wbe16(bat + 6, (u16)(be16p(bat + 6) + n));
+    memset(e, 0xFF, 0x40);
+    mc_commit(dir, bat); return 1;
+}
+/* 1 imported, 0 failed, -1 no room, -2 already on the card */
+static int mc_import_one(const u8* g, long len) {
+    if (len < 0x40) return 0;
+    int n = be16p(g + 0x38); if (len < 0x40 + (long)n * 0x2000 || n <= 0) return 0;
+    u8 dir[0x2000], bat[0x2000]; memcpy(dir, g_mc + mc_active(1, 2) * 0x2000, 0x2000); memcpy(bat, g_mc + mc_active(3, 4) * 0x2000, 0x2000);
+    int slot = -1;
+    for (int i = 0; i < 127; i++) { u8* e = dir + i * 0x40; if (e[0] == 0xFF) { if (slot < 0) slot = i; continue; } if (!memcmp(e, g, 6) && !memcmp(e + 8, g + 8, 32)) return -2; }
+    int nblk = (int)(g_mc_size / 0x2000);
+    if (slot < 0 || be16p(bat + 6) < n) return -1;
+    u16 list[2048]; int got = 0;
+    for (int b = 5; b < nblk && got < n; b++) if (!be16p(bat + 0xA + 2 * (b - 5))) list[got++] = (u16)b;
+    if (got < n) return -1;
+    for (int k = 0; k < n; k++) { wbe16(bat + 0xA + 2 * (list[k] - 5), k + 1 < n ? list[k + 1] : 0xFFFF); memcpy(g_mc + list[k] * 0x2000, g + 0x40 + k * 0x2000, 0x2000); mc_flush(list[k] * 0x2000u, 0x2000); }
+    wbe16(bat + 6, (u16)(be16p(bat + 6) - n)); wbe16(bat + 8, list[n - 1]);
+    u8* e = dir + slot * 0x40; memcpy(e, g, 0x40); wbe16(e + 0x36, list[0]);
+    mc_commit(dir, bat); return 1;
+}
+/* imports every .gci in the GCI folder; returns how many were added, *skipped = already present or no room */
+int mc_import_folder(int* skipped, int* noroom) {
+    mc_init(); *skipped = *noroom = 0; if (!g_mc_on) return 0;
+    DIR* d = opendir("GCI"); if (!d) return 0;
+    struct dirent* de; int added = 0;
+    while ((de = readdir(d))) {
+        size_t l = strlen(de->d_name); if (l < 5 || (strcmp(de->d_name + l - 4, ".gci") && strcmp(de->d_name + l - 4, ".GCI"))) continue;
+        char p[600]; snprintf(p, sizeof p, "GCI/%s", de->d_name);
+        FILE* f = fopen(p, "rb"); if (!f) continue; fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        u8* b = malloc(n); size_t got = fread(b, 1, n, f); fclose(f);
+        int r = got == (size_t)n ? mc_import_one(b, n) : 0; free(b);
+        if (r == 1) added++; else if (r == -2) (*skipped)++; else if (r == -1) (*noroom)++;
+    }
+    closedir(d); return added;
+}
+int mc_backup(char* out, int cap) {
+    mc_init(); if (!g_mc_on) return 0;
+#ifdef _WIN32
+    mkdir("Backups");
+#else
+    mkdir("Backups", 0755);
+#endif
+    time_t t = time(0); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%d_%H-%M-%S", localtime(&t));
+    snprintf(out, cap, "Backups/MemoryCardA_%s.raw", ts);
+    FILE* f = fopen(out, "wb"); if (!f) return 0;
+    int ok = fwrite(g_mc, 1, g_mc_size, f) == g_mc_size; fclose(f); return ok;
 }

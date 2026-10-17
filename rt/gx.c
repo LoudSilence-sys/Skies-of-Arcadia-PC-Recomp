@@ -1118,7 +1118,7 @@ static void interp_frame_done(void) {
     {   /* the game already shows a new frame every field (some cutscenes and menus): nothing to fill in */
         static u64 last_vi; u64 vi = g_frames; int fields = (int)(vi - last_vi); last_vi = vi;
         if (fields <= 1) late = 1;
-        { extern int g_ff_mult; if (g_ff_mult > 1) late = 1; }   /* fast-forward: no in-between frames */
+        { extern int g_battle_mult; if (g_battle_mult > 1) late = 1; }   /* fast-forward / battle speed: no in-between frames */
     }
     if (late) { g_pending_real = 0; gl_show_saved(1); platform_present(); gl_show_saved(0); }   /* the previous real frame never got its own field */
     if (g_prev_ok && !late) {
@@ -1158,6 +1158,7 @@ void options_pause_loop(void) {
 char g_perf_text[3][200];   /* on-screen performance readout (F3) */
 int g_perf_overlay;
 void gx_frame_done(int w, int h) {
+    if (g_use_gl) { extern void gl_thumb_capture(void); gl_thumb_capture(); }
     g_tex_epoch++;
     if (g_use_gl && !g_interp) { extern void gl_save_real(void); gl_save_real(); }   /* (interpolation saves it itself) */
     if (g_interp < 0) {
@@ -1194,6 +1195,10 @@ presented:;
 #undef D
     }
     dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
+    {   /* SOA_POSTTEST=frame: write the output filters (FXAA, sharpen, CRT) to post1..3.png */
+        static int pf = -2; if (pf == -2) { const char* e = getenv("SOA_POSTTEST"); pf = e ? atoi(e) : -1; }
+        if (pf >= 0 && g_frame_no >= pf && g_use_gl) { pf = -1; extern void gl_post_test(int, const char*); gl_post_test(0, "post0.png"); gl_post_test(1, "post1.png"); gl_post_test(2, "post2.png"); gl_post_test(3, "post3.png"); }
+    }
     {   /* SOA_SHOT=frame: take a screenshot (F12) at that frame */
         static int sf = -2; if (sf == -2) { const char* e = getenv("SOA_SHOT"); sf = e ? atoi(e) : -1; }
         if (sf >= 0 && g_frame_no >= sf) { sf = -1; extern void screenshot_request(void); screenshot_request(); }

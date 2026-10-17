@@ -95,21 +95,98 @@ int platform_init(void) {
     return gl_load(win_getproc);
 }
 
-/* ---- XInput (loaded dynamically) ---- */
+/* ---- controllers: SDL2 (SDL2.dll next to the exe: DualSense/DualShock, Switch Pro, GameCube adapter, Xbox...)
+   with XInput as the fallback. Both are loaded at run time; the buttons are reported in XInput's layout. ---- */
 typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XPad;
 typedef struct { DWORD packet; XPad pad; } XState;
+typedef struct { WORD l, r; } XVib;
 typedef DWORD (WINAPI* PFNXGET)(DWORD, XState*);
-static PFNXGET g_xget; static int g_xtried;
-
+typedef DWORD (WINAPI* PFNXSET)(DWORD, XVib*);
+static PFNXGET g_xget; static PFNXSET g_xset; static int g_xtried;
+/* SDL2 entry points */
+typedef void* SDLGC;
+static int (*sdl_Init)(unsigned); static int (*sdl_NumJoysticks)(void); static int (*sdl_IsGameController)(int);
+static SDLGC (*sdl_GCOpen)(int); static void (*sdl_GCClose)(SDLGC); static int (*sdl_GCAttached)(SDLGC);
+static unsigned char (*sdl_GCButton)(SDLGC, int); static short (*sdl_GCAxis)(SDLGC, int); static void (*sdl_GCUpdate)(void);
+static int (*sdl_GCRumble)(SDLGC, unsigned short, unsigned short, unsigned); static int (*sdl_GCType)(SDLGC);
+static int (*sdl_SetHint)(const char*, const char*); static void (*sdl_PumpEvents)(void); static const char* (*sdl_GCName)(SDLGC);
+static int g_sdl = -1; static SDLGC g_gc; static u64 g_gc_scan;
+extern int g_pad_type;
+static void sdl_load(void) {
+    g_sdl = 0;
+    HMODULE m = LoadLibraryA("SDL2.dll"); if (!m) return;
+#define L(v, n) *(FARPROC*)&v = GetProcAddress(m, n); if (!v) return;
+    L(sdl_Init, "SDL_Init") L(sdl_NumJoysticks, "SDL_NumJoysticks") L(sdl_IsGameController, "SDL_IsGameController")
+    L(sdl_GCOpen, "SDL_GameControllerOpen") L(sdl_GCClose, "SDL_GameControllerClose") L(sdl_GCAttached, "SDL_GameControllerGetAttached")
+    L(sdl_GCButton, "SDL_GameControllerGetButton") L(sdl_GCAxis, "SDL_GameControllerGetAxis") L(sdl_GCUpdate, "SDL_GameControllerUpdate")
+    L(sdl_GCRumble, "SDL_GameControllerRumble") L(sdl_GCType, "SDL_GameControllerGetType") L(sdl_SetHint, "SDL_SetHint") L(sdl_PumpEvents, "SDL_PumpEvents")
+    L(sdl_GCName, "SDL_GameControllerName")
+#undef L
+    sdl_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    sdl_SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");   /* positional: the bottom face button is always "A" */
+    sdl_SetHint("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1"); sdl_SetHint("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1");
+    if (sdl_Init(0x2000 | 0x200 | 0x4000) != 0) return;   /* GAMECONTROLLER | JOYSTICK | EVENTS */
+    g_sdl = 1; rt_log("input: SDL2 loaded\n");
+}
+static int pad_type_of(int t, const char* name) {
+    if (t == 3 || t == 4 || t == 7) return 2;                 /* PS3 / PS4 / PS5 */
+    if (name && (strstr(name, "GameCube") || strstr(name, "Gamecube"))) return 4;   /* official adapter / clones */
+    if (t == 5 || (t >= 11 && t <= 13)) return 3;            /* Switch Pro / Joy-Con */
+    return 1;
+}
+static int sdl_poll(long* xb, int* lt, int* rt, int* lx, int* ly, int* rx, int* ry) {
+    if (g_sdl < 0) sdl_load();
+    if (g_sdl <= 0) return 0;
+    sdl_PumpEvents(); sdl_GCUpdate();
+    if (g_gc && !sdl_GCAttached(g_gc)) { sdl_GCClose(g_gc); g_gc = 0; osd_message("Controller disconnected"); }
+    if (!g_gc) {
+        u64 now = GetTickCount64(); if (now - g_gc_scan < 1000) return 0; g_gc_scan = now;
+        for (int i = 0; i < sdl_NumJoysticks(); i++) if (sdl_IsGameController(i)) { g_gc = sdl_GCOpen(i); if (g_gc) break; }
+        if (!g_gc) return 0;
+        const char* nm = sdl_GCName(g_gc); g_pad_type = pad_type_of(sdl_GCType(g_gc), nm);
+        osd_message("Controller: %s", nm ? nm : "connected"); rt_log("input: SDL controller %s type %d\n", nm ? nm : "?", sdl_GCType(g_gc));
+    }
+    static const struct { int b; long x; } map[] = {{0, 0x1000}, {1, 0x2000}, {2, 0x4000}, {3, 0x8000}, {4, 0x20}, {6, 0x10}, {7, 0x40}, {8, 0x80},
+        {9, 0x100}, {10, 0x200}, {11, 1}, {12, 2}, {13, 4}, {14, 8}};
+    long b = 0; for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) if (sdl_GCButton(g_gc, map[i].b)) b |= map[i].x;
+    *lx = sdl_GCAxis(g_gc, 0); *ly = -1 - sdl_GCAxis(g_gc, 1); *rx = sdl_GCAxis(g_gc, 2); *ry = -1 - sdl_GCAxis(g_gc, 3);
+    *lt = sdl_GCAxis(g_gc, 4) / 128; *rt = sdl_GCAxis(g_gc, 5) / 128;
+    *xb = b; return 1;
+}
+/* rumble from the game (hw.c), refreshed while on; off in the options or when the setting is off */
+static int g_rumble_on; static u64 g_rumble_t;
+void platform_rumble(int on) { g_rumble_on = on; g_rumble_t = 0; }
+static void rumble_tick(void) {
+    static int vib = -1; static u64 chk; u64 now = GetTickCount64();
+    if (vib < 0 || now - chk > 1000) { vib = settings_get("vibration", 1); chk = now; }
+    int on = g_rumble_on && vib && g_focused;
+    static int sent = -1;
+    if (g_gc) { if (on != sent || (on && now - g_rumble_t > 500)) { sdl_GCRumble(g_gc, on ? 0xB000 : 0, on ? 0xB000 : 0, on ? 1000 : 0); g_rumble_t = now; sent = on; } }
+    else if (g_xset && on != sent) { XVib v = {on ? 0xB000 : 0, on ? 0xB000 : 0}; g_xset(0, &v); sent = on; }
+}
 
 void platform_pump(void) {
     MSG msg;
     while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
-    if (!g_xtried) { g_xtried = 1; HMODULE x = LoadLibraryA("xinput1_4.dll"); if (!x) x = LoadLibraryA("xinput9_1_0.dll"); if (x) g_xget = (PFNXGET)GetProcAddress(x, "XInputGetState"); }
-    XState xs; long xb = -1; int lt = 0, rt = 0, lx = 0, ly = 0, rx = 0, ry = 0;
-    if (g_xget && g_xget(0, &xs) == 0) {
-        xb = xs.pad.buttons; lt = xs.pad.lt; rt = xs.pad.rt; lx = xs.pad.lx; ly = xs.pad.ly; rx = xs.pad.rx; ry = xs.pad.ry;
-        if (lt > 200) xb |= 0x10000; if (rt > 200) xb |= 0x20000;
+    if (!g_xtried) { g_xtried = 1; HMODULE x = LoadLibraryA("xinput1_4.dll"); if (!x) x = LoadLibraryA("xinput9_1_0.dll"); if (x) { g_xget = (PFNXGET)GetProcAddress(x, "XInputGetState"); g_xset = (PFNXSET)GetProcAddress(x, "XInputSetState"); } }
+    long xb = -1; int lt = 0, rt = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+    if (sdl_poll(&xb, &lt, &rt, &lx, &ly, &rx, &ry)) { if (lt > 200) xb |= 0x10000; if (rt > 200) xb |= 0x20000; }
+    else {
+        XState xs;
+        if (g_xget && g_xget(0, &xs) == 0) {
+            xb = xs.pad.buttons; lt = xs.pad.lt; rt = xs.pad.rt; lx = xs.pad.lx; ly = xs.pad.ly; rx = xs.pad.rx; ry = xs.pad.ry;
+            if (lt > 200) xb |= 0x10000; if (rt > 200) xb |= 0x20000;
+            if (!g_pad_type) g_pad_type = 1;
+        }
+    }
+    rumble_tick();
+    {   /* which device was used last (button prompts: Auto) */
+        extern int g_last_device; static long pxb; static int pk;
+        int keys = 0; for (int i = 8; i < 256; i++) if (g_keys[i]) { keys = 1; break; }
+        if (keys && !pk) g_last_device = 0;
+        if (xb > 0 && (xb & ~pxb)) g_last_device = 1;
+        if (xb >= 0 && (lx > 16000 || lx < -16000 || ly > 16000 || ly < -16000)) g_last_device = 1;
+        pk = keys; pxb = xb > 0 ? xb : 0;
     }
     g_xbuttons = xb; g_lx = lx; g_ly = ly;
     u32 hi, lo; int ff;
@@ -142,11 +219,12 @@ u32 platform_nav(void) {
     if (KD(VK_PRIOR) || BK(IN_L) || KD('Q')) n |= 64;
     if (KD(VK_NEXT) || BK(IN_R) || KD('E')) n |= 128;
     if (KD(VK_DELETE)) n |= 256;
+    if (KD('S') || BK(IN_Y)) n |= 512;
 #undef KD
 #undef BK
     if (xb >= 0) {
         if (xb & 0x0001) n |= 1; if (xb & 0x0002) n |= 2; if (xb & 0x0004) n |= 4; if (xb & 0x0008) n |= 8;
-        if (xb & 0x1000) n |= 16; if (xb & 0x2000) n |= 32; if (xb & 0x0100) n |= 64; if (xb & 0x0200) n |= 128;
+        if (xb & 0x1000) n |= 16; if (xb & 0x2000) n |= 32; if (xb & 0x8000) n |= 512; if (xb & 0x0100) n |= 64; if (xb & 0x0200) n |= 128;
         if (g_ly > 16000) n |= 1; if (g_ly < -16000) n |= 2; if (g_lx < -16000) n |= 4; if (g_lx > 16000) n |= 8;
     }
     return n;
@@ -182,8 +260,8 @@ void host_audio_write(const s16* stereo, int frames, int rate) {
 void platform_present(void) {
     extern void gl_blit_to_screen(int w, int h);
     {   /* fast-forward renders 2-4x the frames: show at most one per display refresh */
-        extern int g_ff_mult; static LARGE_INTEGER f, last; LARGE_INTEGER now; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
-        if (g_ff_mult > 1 && (now.QuadPart - last.QuadPart) * 1000 < f.QuadPart * 15) return;
+        extern int g_battle_mult; static LARGE_INTEGER f, last; LARGE_INTEGER now; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+        if (g_battle_mult > 1 && (now.QuadPart - last.QuadPart) * 1000 < f.QuadPart * 15) return;
         last = now;
     }
     gl_blit_to_screen(g_win_w, g_win_h);

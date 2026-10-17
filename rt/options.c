@@ -7,6 +7,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+static void card_draw(float wx, float wy, float ww, float wh, float a);
+static void card_input(unsigned press, int* sel);
+static char g_mcn[127][48]; static int g_mcb[127], g_mcnum = -1, g_mcfree, g_mc_confirm = -1;
+static char g_mc_status[160];
 
 void gl_set_scale(int s);
 void gl_set_widescreen(int on);
@@ -18,7 +22,10 @@ WEAK void platform_set_fullscreen(int on) { (void)on; }
 WEAK int platform_get_fullscreen(void) { return 0; }
 WEAK void platform_set_vsync(int on) { (void)on; }
 WEAK void dcsnd_set_enabled(int on) { (void)on; }
-WEAK u32 platform_nav(void) { return 0; }          /* raw keyboard/controller navigation bits (win32.c) */
+WEAK u32 platform_nav(void) { return 0; }
+void quickstate_request_slot(int load, int slot); int quickstate_slot_info(int slot, char* when, int cap); void quickstate_slot_path(int slot, char* out, int cap);
+void ui_image(float x, float y, float w, float h, unsigned tex, float a); unsigned gl_ui_texture(const u8* rgba, int w, int h); void gl_ui_texture_free(unsigned t);
+u8* texpack_load_png(const char* path, int* w, int* h); void texpack_free(void* p);          /* raw keyboard/controller navigation bits (win32.c) */
 WEAK int platform_take_key(void) { return 0; }     /* last key pressed (virtual-key code), cleared on read */
 WEAK long platform_xbuttons(void) { return -1; }   /* raw controller buttons, -1 without a controller */
 void interp_set(int on);
@@ -29,7 +36,7 @@ WEAK void text_speed_changed(void) {}
 WEAK void ws_hud_changed(void) {}
 
 /* navigation bits */
-enum { N_UP = 1, N_DOWN = 2, N_LEFT = 4, N_RIGHT = 8, N_OK = 16, N_BACK = 32, N_TABL = 64, N_TABR = 128, N_CLEAR = 256, N_NATIVE = 0x80000000u };
+enum { N_UP = 1, N_DOWN = 2, N_LEFT = 4, N_RIGHT = 8, N_OK = 16, N_BACK = 32, N_TABL = 64, N_TABR = 128, N_CLEAR = 256, N_ALT = 512, N_NATIVE = 0x80000000u };
 
 /* ---------------- items ---------------- */
 enum { K_CHOICE, K_SLIDER, K_ACTION, K_BIND };
@@ -76,13 +83,19 @@ static const int MSAA_V[] = {1, 2, 4, 8};
 static const char* const MSAA_L[] = {"Off", "2x MSAA", "4x MSAA", "8x MSAA"};
 static const int ANI_V[] = {1, 2, 4, 8, 16};
 static const char* const ANI_L[] = {"Off", "2x", "4x", "8x", "16x"};
+static const char* const POST_L[] = {"Off", "FXAA", "Sharpen", "CRT"};
 static const char* const ENC_L[] = {"Normal", "Half", "Quarter", "None"};
 static const char* const TXT_L[] = {"Normal", "Fast", "Instant"};
 static const char* const FFM_L[] = {"Hold", "Toggle"};
-static const int FFS_V[] = {2, 3, 4};
-static const char* const FFS_L[] = {"2x", "3x", "4x"};
+static const int FFS_V[] = {2, 3, 4, 6, 8};
+static const char* const FFS_L[] = {"2x", "3x", "4x", "6x", "8x"};
+static const int BS_V[] = {1, 2, 3, 4};
+static const char* const BS_L[] = {"Normal", "2x", "3x", "4x"};
 static const char* const HUD_L[] = {"Centered", "Screen edges"};
 static const char* const LAY_L[] = {"Xbox", "GameCube"};
+static const char* const PROMPT_L[] = {"Auto", "GameCube", "Xbox", "PlayStation", "Switch", "Keyboard"};
+WEAK void prompts_changed(void) {}
+static void ap_prompts(int v) { (void)v; prompts_changed(); }
 static const int SLOT_V[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 static const char* const SLOT_L[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
 enum { ACT_RESET_KEYS = 1, ACT_BACK };
@@ -93,6 +106,7 @@ static Item P_DISPLAY[] = {
     CH("Widescreen (16:9)", "widescreen", 0, 0, OFFON, "Shows more of the world at the sides. Menus and text stay 4:3.", ap_wide),
     CH("Widescreen HUD", "ws_hud", 0, 0, HUD_L, "In widescreen, the minimap and battle HUD sit at the screen edges instead of the 4:3 frame.", ap_wshud),
     {"Fullscreen", K_CHOICE, "fullscreen", 0, 2, 0, OFFON, "Borderless fullscreen. Alt+Enter or F11 also switches.", ap_full, get_full},
+    CH("Integer scaling", "integer_scaling", 0, 0, OFFON, "Scale the picture by whole steps of 480 lines for even pixels (may leave a border).", 0),
     CH("V-Sync", "vsync", 0, 0, OFFON, "Synchronise with the display to avoid tearing.", ap_vsync),
     CH("Refresh rate", "pal60", 1, 0, HZ_L, "60 Hz runs the game at full speed (PAL60). Applies after a restart.", ap_hz),
     CH("Pause when in background", "pause_unfocused", 1, 0, OFFON, "Pause the game while the window is not focused.", 0),
@@ -101,14 +115,18 @@ static Item P_GRAPHICS[] = {
     CH("60 FPS (interpolated)", "fps60", 1, 0, OFFON, "Generates in-between frames so the game moves at 60 frames per second.", ap_fps60),
     CH("Anti-aliasing", "msaa", 1, MSAA_V, MSAA_L, "Smooths jagged edges. Higher settings cost more GPU time.", ap_msaa),
     CH("Texture filtering", "anisotropy", 4, ANI_V, ANI_L, "Anisotropic filtering keeps textures sharp at steep angles.", ap_aniso),
+    CH("Output filter", "post_filter", 0, 0, POST_L, "FXAA smooths edges cheaply, Sharpen crisps the picture, CRT imitates a television.", 0),
     CH("HD texture packs", "hd_textures", 1, 0, OFFON, "Loads Dolphin-format texture packs from Load/Textures/GEAP8P.", ap_hd),
     {"Performance overlay", K_CHOICE, 0, 0, 2, 0, OFFON, "Frame rate and timing in the top-left corner (F3).", ap_perf, get_perf},
 };
 static Item P_GAMEPLAY[] = {
     CH("Encounter rate", "encounter_rate", 0, 0, ENC_L, "How often random battles happen. Normal is the original rate.", ap_enc),
+    CH("Battle speed", "battle_speed", 1, BS_V, BS_L, "Speeds up battle animations. Choosing commands stays at normal speed.", 0),
     CH("Text speed", "text_speed", 0, 0, TXT_L, "How fast dialogue and battle messages appear.", ap_text),
+    CH("Uncensored text", "uncensored_text", 0, 0, OFFON, "Restores the original \"rum\" that the western releases renamed \"loqua\".", 0),
     CH("Fast-forward", "ff_toggle", 0, 0, FFM_L, "Hold the fast-forward button (Tab / right stick), or press it to switch.", 0),
     CH("Fast-forward speed", "ff_speed", 3, FFS_V, FFS_L, "How much faster the game runs while fast-forwarding.", 0),
+    CH("Rewind", "rewind", 0, 0, OFFON, "Keeps the last minute of play: hold Backspace (or View / Create) to step back.", 0),
     {"Save state slot", K_CHOICE, "quickstate_slot", 1, 10, SLOT_V, SLOT_L, "F5 saves the exact moment to this slot, F9 loads it. F6/F7 also change slot.", ap_slot, get_slot},
 };
 static Item P_AUDIO[] = {
@@ -117,27 +135,34 @@ static Item P_AUDIO[] = {
     {"Music volume", K_SLIDER, "volume_music", 100, 0, 0, 0, "Volume of the music.", ap_vmu},
     {"Effects volume", K_SLIDER, "volume_effects", 100, 0, 0, 0, "Volume of sound effects and voices.", ap_vfx},
 };
-static Item P_CONTROLS[3 + IN_N];
+static Item P_CONTROLS[5 + IN_N];
 static int g_ctl_n;
 static void controls_init(void) {
     if (g_ctl_n) return;
     int k = 0;
     P_CONTROLS[k++] = (Item){"Controller layout", K_CHOICE, "pad_layout", 0, 2, 0, LAY_L, "Xbox: A confirms, B cancels. GameCube: buttons by position, as on the original pad.", ap_layout};
+    P_CONTROLS[k++] = (Item){"Button names", K_CHOICE, "button_prompts", 0, 6, 0, PROMPT_L, "How the game's messages name buttons. Auto follows the keyboard or controller you last used.", ap_prompts};
+    P_CONTROLS[k++] = (Item){"Vibration", K_CHOICE, "vibration", 1, 2, 0, OFFON, "Controller rumble where the game uses it.", 0};
     static const int order[IN_N] = {IN_A, IN_B, IN_X, IN_Y, IN_START, IN_L, IN_R, IN_Z, IN_SUP, IN_SDOWN, IN_SLEFT, IN_SRIGHT,
-                                   IN_CUP, IN_CDOWN, IN_CLEFT, IN_CRIGHT, IN_DUP, IN_DDOWN, IN_DLEFT, IN_DRIGHT, IN_FF};
+                                   IN_CUP, IN_CDOWN, IN_CLEFT, IN_CRIGHT, IN_DUP, IN_DDOWN, IN_DLEFT, IN_DRIGHT, IN_FF, IN_REWIND};
     for (int i = 0; i < IN_N; i++) P_CONTROLS[k++] = (Item){input_name(order[i]), K_BIND, 0, 0, 0, 0, 0, "The keyboard key and controller button for each GameCube button.", 0, 0, order[i]};
     P_CONTROLS[k++] = (Item){"Reset keyboard to defaults", K_ACTION, 0, 0, 0, 0, 0, "Restores the default keys. The controller layout above resets the controller.", 0, 0, ACT_RESET_KEYS};
     g_ctl_n = k;
 }
 typedef struct { const char* name; Item* items; int n; } Page;
-static Page g_pages[5] = {
+static void g_mcnum_reset(void);
+static Page g_pages[7] = {
     {"Display", P_DISPLAY, sizeof P_DISPLAY / sizeof P_DISPLAY[0]},
     {"Graphics", P_GRAPHICS, sizeof P_GRAPHICS / sizeof P_GRAPHICS[0]},
     {"Gameplay", P_GAMEPLAY, sizeof P_GAMEPLAY / sizeof P_GAMEPLAY[0]},
     {"Audio", P_AUDIO, sizeof P_AUDIO / sizeof P_AUDIO[0]},
     {"Controls", P_CONTROLS, 0},
+    {"States", 0, 10},
+    {"Card", 0, 0},
 };
-#define NPAGE 5
+#define NPAGE 7
+#define PAGE_STATES 5
+#define PAGE_CARD 6
 
 static int item_val(const Item* it) { return it->get ? it->get() : it->key ? settings_get(it->key, it->def) : it->def; }
 static int choice_index(const Item* it) {
@@ -170,7 +195,7 @@ int options_is_open(void) { return g_open; }
 void options_open(void) {
     if (g_open) return;
     controls_init(); g_pages[4].n = g_ctl_n;
-    g_open = 1; g_fade = 0; g_prev = 0xFFFFFFFFu; g_capture = 0; g_tabrow = 0;
+    g_open = 1; g_fade = 0; g_prev = 0xFFFFFFFFu; g_capture = 0; g_tabrow = 0; g_mcnum_reset();
     platform_take_key();
     rt_log("options: open\n");
 }
@@ -201,7 +226,14 @@ void options_input(u32 hi) {
     {   /* tests: SOA_OPTTEST=frame,page,row opens the options on that page and row */
         static int init, fr = -1, pg, row; extern int g_frame_no_pub;
         if (!init) { init = 1; const char* e = getenv("SOA_OPTTEST"); if (e) sscanf(e, "%d,%d,%d", &fr, &pg, &row); }
-        if (fr >= 0 && g_frame_no_pub >= fr) { fr = -1; options_open(); g_page = pg; g_sel[pg] = row; }
+        if (fr >= 0 && g_frame_no_pub >= fr) { fr = -1; options_open(); g_page = pg; g_sel[pg] = row;
+            const char* ops = getenv("SOA_CARDOPS");   /* tests: e.g. "e0,d0,d0,i,b" export / delete (twice = confirm) / import / backup */
+            for (; ops && *ops; ops++) { int k = atoi(ops + 1); g_sel[PAGE_CARD] = k;
+                if (*ops == 'e') card_input(N_OK, &g_sel[PAGE_CARD]); else if (*ops == 'd') card_input(N_CLEAR, &g_sel[PAGE_CARD]);
+                else if (*ops == 'i') { g_sel[PAGE_CARD] = g_mcnum; card_input(N_OK, &g_sel[PAGE_CARD]); } else if (*ops == 'b') { g_sel[PAGE_CARD] = g_mcnum + 1; card_input(N_OK, &g_sel[PAGE_CARD]); }
+                else continue;
+                rt_log("cardop %c: %s\n", *ops, g_mc_status); while (ops[1] && ops[1] != ',') ops++; }
+            g_sel[PAGE_CARD] = 0; }
     }
     if (!g_open) return;
     g_fade++;
@@ -215,6 +247,7 @@ void options_input(u32 hi) {
     if (b & 0x0002 || sx > 0xB0) nav |= N_RIGHT;
     if (b & 0x0100) nav |= N_OK;
     if (b & (0x0200 | 0x1000)) nav |= N_BACK;
+    if (b & 0x0800) nav |= N_ALT;    /* Y */
     if (b & 0x0040) nav |= N_TABL;   /* L */
     if (b & 0x0020) nav |= N_TABR;   /* R */
     if (g_prev == 0xFFFFFFFFu) { g_prev = nav; return; }   /* ignore what was held when opening */
@@ -230,8 +263,20 @@ void options_input(u32 hi) {
         if (press & N_LEFT) g_page = (g_page + NPAGE - 1) % NPAGE;
         if (press & N_RIGHT) g_page = (g_page + 1) % NPAGE;
         if (press & (N_DOWN | N_OK)) { g_tabrow = 0; g_sel[g_page] = 0; }
-        if (press & N_UP) { g_tabrow = 0; g_sel[g_page] = g_pages[g_page].n; }   /* wraps to "Back" */
+        if (press & N_UP) { g_tabrow = 0; g_sel[g_page] = g_page == PAGE_STATES ? 5 : g_pages[g_page].n; }   /* wraps to "Back" (bottom row of the states grid) */
         if (press & N_BACK) options_close();
+        return;
+    }
+    if (g_page == PAGE_CARD) { card_input(press, sel); return; }
+    if (g_page == PAGE_STATES) {   /* 5 x 2 grid of slots */
+        if (press & N_LEFT) *sel = (*sel + 9) % 10;
+        if (press & N_RIGHT) *sel = (*sel + 1) % 10;
+        if (press & N_UP) { if (*sel < 5) g_tabrow = 1; else *sel -= 5; }
+        if (press & N_DOWN) { if (*sel < 5) *sel += 5; else g_tabrow = 1; }
+        char when[40];
+        if ((press & N_OK) && quickstate_slot_info(*sel + 1, when, sizeof when)) { options_close(); quickstate_request_slot(1, *sel + 1); }
+        else if (press & N_ALT) { options_close(); quickstate_request_slot(0, *sel + 1); }
+        else if (press & N_BACK) options_close();
         return;
     }
     int nrow = pg->n + 1;   /* + Back */
@@ -251,6 +296,8 @@ void options_input(u32 hi) {
 }
 
 /* ---------------- drawing (virtual 640x480 coordinates inside the given 4:3 rectangle) ---------------- */
+static void states_draw(float wx, float wy, float ww, float wh, float a);
+
 static float X0, Y0, K;
 static void rect(float x, float y, float w, float h, const float* a, const float* b) { ui_rect(X0 + x * K, Y0 + y * K, w * K, h * K, a, b); }
 static void text(float x, float y, float sz, const char* s, const float* c) {
@@ -290,18 +337,22 @@ void options_draw(float x, float y, float w, float h) {
     ui_title(X0 + (320 - 104) * K, Y0 + 34 * K, 208 * K, 54 * K, a);
     float white[4] = {1, 1, 1, a}, gold[4] = {1.f, 0.90f, 0.35f, a}, grey[4] = {0.66f, 0.72f, 0.86f, a}, dimw[4] = {0.75f, 0.80f, 0.92f, a};
     /* tabs */
-    float tx = wx + 10, tws = (ww - 20) / NPAGE;
-    for (int p = 0; p < NPAGE; p++) {
-        float bx = tx + p * tws;
-        if (p == g_page) {
-            float t0[4] = {0.50f, 0.72f, 1.f, (g_tabrow ? 0.55f : 0.35f) * a}, t1[4] = {0.25f, 0.45f, 0.95f, 0.20f * a};
-            rect(bx + 2, wy + 8, tws - 4, 30, t0, t1);
-            float ul[4] = {1.f, 0.90f, 0.35f, a}; rect(bx + 10, wy + 36, tws - 20, 2, ul, ul);
-        }
-        const char* nm = g_pages[p].name;
-        text(bx + tws / 2 - tw(nm, 17) / 2, wy + 13, 17, nm, p == g_page ? gold : dimw);
-    }
+    /* tabs: widths follow the labels */
+    { const float fs = 15.f; float tot = 0; for (int p = 0; p < NPAGE; p++) tot += tw(g_pages[p].name, fs);
+      float gap = (ww - 20 - tot) / NPAGE, bx = wx + 10;
+      for (int p = 0; p < NPAGE; p++) {
+          const char* nm = g_pages[p].name; float w = tw(nm, fs) + gap;
+          if (p == g_page) {
+              float t0[4] = {0.50f, 0.72f, 1.f, (g_tabrow ? 0.55f : 0.35f) * a}, t1[4] = {0.25f, 0.45f, 0.95f, 0.20f * a};
+              rect(bx + 1, wy + 8, w - 2, 30, t0, t1);
+              float ul[4] = {1.f, 0.90f, 0.35f, a}; rect(bx + gap / 2 - 2, wy + 36, w - gap + 4, 2, ul, ul);
+          }
+          text(bx + gap / 2, wy + 14, fs, nm, p == g_page ? gold : dimw);
+          bx += w;
+      } }
     float sep[4] = {0.62f, 0.78f, 1.f, 0.35f * a}; rect(wx + 10, wy + 44, ww - 20, 1, sep, sep);
+    if (g_page == PAGE_STATES) { states_draw(wx, wy, ww, wh, a); return; }
+    if (g_page == PAGE_CARD) { card_draw(wx, wy, ww, wh, a); return; }
     /* rows */
     Page* pg = &g_pages[g_page];
     const int VIS = 8; const float RH = 29, ry0 = wy + 54;
@@ -358,3 +409,94 @@ void options_draw(float x, float y, float w, float h) {
     const char* keys = "F5 Save state    F9 Load state    F6/F7 Slot    F12 Screenshot    F3 Performance";
     float kw = tw(keys, 12); text(320 - kw / 2, wy + wh + 8, 12, keys, grey);
 }
+
+/* ---------------- the states page: 10 save-state slots with thumbnails ---------------- */
+static unsigned g_th[10]; static int g_th_tw[10], g_th_th[10]; static long long g_th_stamp[10]; static volatile int g_th_dirty = 1;
+void states_page_dirty(void) { g_th_dirty = 1; }
+#include <sys/stat.h>
+static void states_refresh(void) {
+    g_th_dirty = 0;
+    for (int i = 0; i < 10; i++) {
+        char p[80], tp[96]; quickstate_slot_path(i + 1, p, sizeof p); snprintf(tp, sizeof tp, "%s.png", p);
+        struct stat st; long long stamp = stat(tp, &st) ? 0 : (long long)st.st_mtime;
+        if (stat(p, &st)) stamp = 0;
+        if (stamp == g_th_stamp[i] && (g_th[i] || !stamp)) continue;
+        if (g_th[i]) { gl_ui_texture_free(g_th[i]); g_th[i] = 0; }
+        g_th_stamp[i] = stamp;
+        if (!stamp) continue;
+        int w, h; u8* px = texpack_load_png(tp, &w, &h);
+        if (px) { g_th[i] = gl_ui_texture(px, w, h); g_th_tw[i] = w; g_th_th[i] = h; texpack_free(px); }
+    }
+}
+static void states_draw(float wx, float wy, float ww, float wh, float a) {
+    if (g_th_dirty) states_refresh();
+    float white[4] = {1, 1, 1, a}, gold[4] = {1.f, 0.90f, 0.35f, a}, grey[4] = {0.66f, 0.72f, 0.86f, a}, dimw[4] = {0.75f, 0.80f, 0.92f, a};
+    int sel = g_sel[PAGE_STATES], cur = quickstate_get_slot();
+    float cw = 100, chh = 75, gx0 = wx + (ww - 5 * cw - 4 * 6) / 2, gy0 = wy + 58;
+    for (int i = 0; i < 10; i++) {
+        float x = gx0 + (i % 5) * (cw + 6), y = gy0 + (i / 5) * (chh + 50);
+        int focus = i == sel && !g_tabrow;
+        float rim[4] = {0.62f, 0.78f, 1.f, (focus ? 1.f : 0.45f) * a}, bg[4] = {0.02f, 0.05f, 0.20f, 0.9f * a};
+        if (focus) { float g4[4] = {1.f, 0.90f, 0.35f, a}; rect(x - 3, y - 3, cw + 6, chh + 6, g4, g4); }
+        else rect(x - 1, y - 1, cw + 2, chh + 2, rim, rim);
+        rect(x, y, cw, chh, bg, bg);
+        char when[40]; int has = quickstate_slot_info(i + 1, when, sizeof when);
+        if (has && g_th[i]) {   /* letterbox the thumbnail into the cell */
+            float ar = (float)g_th_tw[i] / g_th_th[i], dw = cw, dh = cw / ar; if (dh > chh) { dh = chh; dw = chh * ar; }
+            ui_image(X0 + (x + (cw - dw) / 2) * K, Y0 + (y + (chh - dh) / 2) * K, dw * K, dh * K, g_th[i], a);
+        } else { const char* e = has ? "No picture" : "Empty"; text(x + cw / 2 - tw(e, 14) / 2, y + chh / 2 - 9, 14, e, grey); }
+        char lab[24]; snprintf(lab, sizeof lab, i + 1 == cur ? "Slot %d *" : "Slot %d", i + 1);
+        text(x + cw / 2 - tw(lab, 15) / 2, y + chh + 4, 15, lab, focus ? gold : white);
+        if (has) text(x + cw / 2 - tw(when, 12) / 2, y + chh + 22, 12, when, dimw);
+    }
+    float sep[4] = {0.62f, 0.78f, 1.f, 0.35f * a}; rect(wx + 10, wy + wh - 62, ww - 20, 1, sep, sep);
+    char help[120]; snprintf(help, sizeof help, "Slot %d * is the one F5 / F9 use (F6 / F7 change it).", cur);
+    text(wx + 18, wy + wh - 54, 15, help, grey);
+    const char* hint = "A: load    Y / S: save here    L/R or Q/E: page    B: back";
+    text(320 - tw(hint, 14) / 2, wy + wh - 26, 14, hint, dimw);
+}
+
+/* ---------------- the memory card page ---------------- */
+int mc_list(char names[][48], int* blocks, int max, int* free_blocks); int mc_export(int k, char* out, int cap); int mc_delete(int k);
+int mc_import_folder(int* skipped, int* noroom); int mc_backup(char* out, int cap);
+static void card_refresh(void) { g_mcnum = mc_list(g_mcn, g_mcb, 127, &g_mcfree); }
+static void card_input(unsigned press, int* sel) {
+    if (g_mcnum < 0) card_refresh();
+    int n = g_mcnum < 0 ? 0 : g_mcnum, rows = n + 2;   /* saves, import, backup */
+    if (press & N_UP) { if (*sel == 0) g_tabrow = 1; else (*sel)--; g_mc_confirm = -1; }
+    if (press & N_DOWN) { if (*sel < rows - 1) (*sel)++; else g_tabrow = 1; g_mc_confirm = -1; }
+    if (*sel >= rows) *sel = rows - 1;
+    if (press & N_OK) {
+        if (*sel < n) { char p[200]; if (mc_export(*sel, p, sizeof p)) snprintf(g_mc_status, sizeof g_mc_status, "Exported to %s", p); else snprintf(g_mc_status, sizeof g_mc_status, "Export failed"); }
+        else if (*sel == n) { int sk, nr; int k = mc_import_folder(&sk, &nr); card_refresh();
+            snprintf(g_mc_status, sizeof g_mc_status, "Imported %d save%s%s%s", k, k == 1 ? "" : "s", sk ? " (others already on the card)" : "", nr ? " - not enough room for some" : ""); }
+        else { char p[200]; if (mc_backup(p, sizeof p)) snprintf(g_mc_status, sizeof g_mc_status, "Backed up to %s", p); else snprintf(g_mc_status, sizeof g_mc_status, "Backup failed"); }
+    }
+    if ((press & (N_CLEAR | N_ALT)) && *sel < n) {
+        if (g_mc_confirm != *sel) { g_mc_confirm = *sel; snprintf(g_mc_status, sizeof g_mc_status, "Press again to delete \"%s\" from the card", g_mcn[*sel] + 5); }
+        else { mc_delete(*sel); g_mc_confirm = -1; card_refresh(); snprintf(g_mc_status, sizeof g_mc_status, "Deleted"); }
+    }
+    if (press & N_BACK) options_close();
+}
+static void card_draw(float wx, float wy, float ww, float wh, float a) {
+    if (g_mcnum < 0) card_refresh();
+    float white[4] = {1, 1, 1, a}, gold[4] = {1.f, 0.90f, 0.35f, a}, grey[4] = {0.66f, 0.72f, 0.86f, a}, dimw[4] = {0.75f, 0.80f, 0.92f, a}, red[4] = {1.f, 0.55f, 0.45f, a};
+    int n = g_mcnum < 0 ? 0 : g_mcnum, rows = n + 2, sel = g_sel[PAGE_CARD];
+    const int VIS = 8; const float RH = 29, ry0 = wy + 54;
+    int* sc = &g_scroll[PAGE_CARD]; if (sel < *sc) *sc = sel; if (sel >= *sc + VIS) *sc = sel - VIS + 1; if (*sc > rows - VIS) *sc = rows - VIS; if (*sc < 0) *sc = 0;
+    for (int r = 0; r < VIS && *sc + r < rows; r++) {
+        int i = *sc + r; float ry = ry0 + r * RH; int focus = i == sel && !g_tabrow;
+        if (focus) { float h0[4] = {0.45f, 0.68f, 1.f, 0.40f * a}, h1[4] = {0.25f, 0.45f, 0.95f, 0.25f * a}; rect(wx + 10, ry - 3, ww - 20, RH - 2, h0, h1); text(wx + 16, ry - 1, 19, ">", gold); }
+        if (i < n) {
+            text(wx + 36, ry + 1, 17, g_mcn[i] + 5, i == g_mc_confirm ? red : focus ? gold : white);
+            char b[24]; snprintf(b, sizeof b, "%d block%s", g_mcb[i], g_mcb[i] == 1 ? "" : "s"); text(wx + ww - 24 - tw(b, 15), ry + 2, 15, b, dimw);
+        } else text(wx + 36, ry, 19, i == n ? "Import .gci saves from the GCI folder" : "Back up the memory card", focus ? gold : white);
+    }
+    if (g_mcnum < 0) text(wx + 36, ry0, 19, "No memory card", grey);
+    float sep[4] = {0.62f, 0.78f, 1.f, 0.35f * a}; rect(wx + 10, wy + wh - 62, ww - 20, 1, sep, sep);
+    char st[200]; if (g_mc_status[0]) snprintf(st, sizeof st, "%s", g_mc_status); else snprintf(st, sizeof st, "Slot A: %d saves, %d blocks free. Use this outside the game's save screens.", n, g_mcfree);
+    text(wx + 18, wy + wh - 54, 14, st, grey);
+    const char* hint = "A: export / run    Delete / Y: delete save    B: back";
+    text(320 - tw(hint, 14) / 2, wy + wh - 26, 14, hint, dimw);
+}
+static void g_mcnum_reset(void) { g_mcnum = -1; g_mc_status[0] = 0; g_mc_confirm = -1; }

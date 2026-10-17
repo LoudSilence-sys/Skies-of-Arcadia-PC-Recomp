@@ -129,3 +129,53 @@ void screenshot_write(u8* rgba, int w, int h) {
     static char last[32]; static int seq; if (!strcmp(last, ts)) snprintf(s->path, sizeof s->path, "Screenshots/SkiesOfArcadia_%s_%d.png", ts, ++seq); else { seq = 0; strcpy(last, ts); }
     pthread_t th; if (pthread_create(&th, 0, shot_worker, s)) shot_worker(s); else pthread_detach(th);
 }
+
+/* ---------------- restored content (options: Uncensored text) ----------------
+   The western releases (and Legends everywhere) renamed the pirates' rum to "loqua". The scripts keep the
+   word inline in each message, so it is rewritten in RAM when a script is loaded: "Loqua" -> "Rum" in the
+   game's language. Shorter words leave the rest of the line in place and pad the line's end with spaces
+   (invisible), so message lengths and script layout never change. Originals are remembered so the option
+   can be switched off again, and only text that still holds what we wrote is touched. */
+#include "rt.h"
+typedef struct { u32 addr; u32 len; u8 orig[96]; u8 cur[96]; } RFix;
+static RFix* g_rf; static int g_rfn, g_rfcap;
+static int is_lower(u8 c) { return (c >= 'a' && c <= 'z') || c >= 0xC0; }
+static int is_alpha(u8 c) { return is_lower(c) || (c >= 'A' && c <= 'Z'); }
+/* rewrite one line segment [s, s+n) */
+static void rum_line(const u8* in, u8* out, int n, const char* rum) {
+    int o = 0, rl = (int)strlen(rum), pad = 0;
+    for (int i = 0; i < n; ) {
+        if (i + 5 <= n && (in[i] == 'L' || in[i] == 'l') && !memcmp(in + i + 1, "oqua", 4) && (i + 5 == n || !is_lower(in[i + 5])) && (i == 0 || !is_alpha(in[i - 1]))) {
+            for (int k = 0; k < rl; k++) out[o++] = (u8)(k == 0 && in[i] == 'L' ? rum[0] - 32 * (rum[0] >= 'a') : rum[k]);
+            pad += 5 - rl; i += 5; continue;
+        }
+        out[o++] = in[i++];
+    }
+    while (pad-- > 0) out[o++] = 0x7F;   /* the font's space */
+}
+void restore_tick(void) {
+    extern u64 g_frames; static u64 last; if (g_frames - last < 50) return; last = g_frames;
+    static int on = -1; static u64 chk; if (on < 0 || g_frames - chk > 100) { on = settings_get("uncensored_text", 0); chk = g_frames; }
+    extern int sram_language(void); int lang = sram_language();
+    const char* rum = lang == 2 ? "rhum" : lang == 3 ? "ron" : lang == 4 ? "rum" : "rum";
+    if (on) for (u32 a = 0; a + 5 < RAM_SIZE; ) {   /* find new occurrences */
+        u8* p = memchr(g_ram + a, 'o', RAM_SIZE - a); if (!p) break;
+        u32 at = (u32)(p - g_ram); a = at + 1;
+        if (at < 1 || at + 4 > RAM_SIZE || memcmp(p, "oqua", 4) || (g_ram[at - 1] != 'L' && g_ram[at - 1] != 'l')) continue;
+        if (at + 4 < RAM_SIZE && is_lower(g_ram[at + 4])) continue;   /* "Loquat" berries */
+        u32 s = at - 1; while (s > 0 && g_ram[s - 1] >= 0x20 && g_ram[s - 1] != '\\' && at - s < 90) s--;   /* segment: back to a control code */
+        if (s >= 1 && g_ram[s - 1] == '\\') s++;   /* skip the code letter after a backslash (\n, \c...) */
+        u32 e = at + 4; while (e < RAM_SIZE && g_ram[e] >= 0x20 && g_ram[e] != '\\' && e - s < 95) e++;
+        if (e - s >= 95) continue;
+        int known = 0; for (int k = 0; k < g_rfn; k++) if (g_rf[k].addr <= at && at < g_rf[k].addr + g_rf[k].len) { known = 1; break; }
+        if (known) continue;
+        if (g_rfn == g_rfcap) { g_rfcap = g_rfcap ? g_rfcap * 2 : 256; g_rf = realloc(g_rf, sizeof *g_rf * g_rfcap); }
+        RFix* f = &g_rf[g_rfn++]; f->addr = s; f->len = e - s; memcpy(f->orig, g_ram + s, f->len); memcpy(f->cur, f->orig, f->len);
+    }
+    for (int k = 0; k < g_rfn; k++) {
+        RFix* f = &g_rf[k];
+        if (memcmp(g_ram + f->addr, f->cur, f->len)) { g_rf[k--] = g_rf[--g_rfn]; continue; }   /* memory reused: forget it */
+        u8 out[96]; if (on) rum_line(f->orig, out, (int)f->len, rum); else memcpy(out, f->orig, f->len);
+        if (memcmp(out, f->cur, f->len)) { memcpy(g_ram + f->addr, out, f->len); memcpy(f->cur, out, f->len); }
+    }
+}

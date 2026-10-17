@@ -95,6 +95,7 @@ WEAK void platform_pump(void) {
 static int g_idle_now;          /* rt_poll called from the idle loop: the game is waiting */
 int g_vi_wait;                  /* a thread is inside VIWaitForRetrace */
 int g_ff_mult = 1;               /* fast-forward multiplier (platform layer sets it while the key is held) */
+int g_battle_mult = 1;           /* the multiplier in effect this field (fast-forward or battle speed) */
 int g_vi_defer_max = 0;         /* retrace held back while the game is busy, up to this many fields (SOA_VIDEFER) */
 void rt_poll(Ctx* c) {
     g_poll_ctr = 2000;
@@ -113,13 +114,22 @@ void rt_poll(Ctx* c) {
     { static int logged; if (logged < 3 && (s64)(now - g_next_vi) >= (s64)(g_vi_period * 10) && !g_idle_now && !g_vi_wait && (s64)(now - g_vi_poll_tb) >= (s64)(TB_RATE / 500)) { logged++; extern void rt_backtrace(Ctx*); rt_log("VI held %d periods; game busy in thread %08X msr %08X:\n", (int)((now - g_next_vi) / g_vi_period), R32(0x800000E4), c->msr); rt_backtrace(c); } }
     int waiting = g_idle_now || g_vi_wait || (s64)(now - g_vi_poll_tb) < (s64)(TB_RATE / 500);   /* idle, in VIWaitForRetrace, or polling the retrace count */
     if ((s64)(now - g_next_vi) >= 0 && (waiting || (s64)(now - g_next_vi) >= (s64)(g_vi_period * (u64)g_vi_defer_max))) {
-        u64 per = g_vi_period / (u64)(g_ff_mult > 1 ? g_ff_mult : 1);   /* fast-forward: fields come faster */
+        int mult = g_ff_mult > 1 ? g_ff_mult : 1;
+        {   /* battle speed (options): battles run faster except while the game waits for a command */
+            extern u64 g_battle_frame, g_cmd_frame; static int bs = -1; static u64 chk;
+            if (bs < 0 || g_frames - chk > 100) { extern int settings_get(const char*, int); bs = settings_get("battle_speed", 1); chk = g_frames; }
+            extern int options_is_open(void);
+            if (bs > 1 && g_frames - g_battle_frame < 8 && g_frames - g_cmd_frame > 6 && !options_is_open() && bs > mult) mult = bs;
+            { static int lg; if (mult > 1 && !lg) { lg = 1; extern void rt_log(const char*, ...); rt_log("battle speed: %dx\n", mult); } }
+            g_battle_mult = mult;
+        }
+        u64 per = g_vi_period / (u64)mult;   /* fast-forward: fields come faster */
         if ((s64)(now - g_next_vi) >= (s64)per) g_next_vi = now + per; /* late: resync rather than catch up */
         else g_next_vi += per;
         g_frames++;
         { extern int g_dbgf, g_frame_no_pub, g_dbg_draw_no; if (g_dbgf && g_frame_no_pub == g_dbgf) rt_log("VI delivered after draw %d (waiting=%d idle=%d viwait=%d)\n", g_dbg_draw_no, waiting, g_idle_now, g_vi_wait); }
         { extern void platform_pump(void); platform_pump(); }
-        vi_retrace_event(); { extern void quickstate_tick(void); quickstate_tick(); }
+        vi_retrace_event(); { extern void quickstate_tick(void); quickstate_tick(); } { extern void prompts_tick(void); prompts_tick(); } { extern void restore_tick(void); restore_tick(); }
         { extern void interp_vi(void); interp_vi(); }
         { extern void options_input(u32); extern u32 si_pad_hi_raw(void); options_input(si_pad_hi_raw()); }
         { extern int game_should_pause(void); extern void options_pause_loop(void); if (game_should_pause()) { options_pause_loop(); g_next_vi = host_tb() + g_vi_period; } }

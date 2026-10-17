@@ -772,6 +772,43 @@ void ui_begin(int w, int h) {
     glUseProgram(g_uprog); glBindVertexArray(g_uvao); { float ss[2] = {(float)w, (float)h}; glUniform2fv(uu_ss, 1, ss); } glUniform1i(uu_t, 0);
     g_umode = -1; g_un = 0; g_uw = (float)w; g_uh = (float)h;
 }
+void ui_image(float x, float y, float w, float h, unsigned tex, float a) { float c[4] = {1, 1, 1, a}; if (!tex) return; ui_mode(1, (GLuint)tex); ui_quad(x, y, w, h, 0, 0, 1, 1, c, c); }
+/* textures for the options screen (save-state thumbnails): RGBA8, rows top-down */
+unsigned gl_ui_texture(const u8* rgba, int w, int h) {
+    GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl_state_dirty(); return t;
+}
+void gl_ui_texture_free(unsigned t) { GLuint g = t; if (g) glDeleteTextures(1, &g); }
+/* a small copy of the last finished frame (save-state thumbnails), refreshed at every XFB copy */
+static GLuint g_thfbo, g_thtex; static int g_thw, g_thh;
+void gl_thumb_capture(void) {
+    int tw = g_ws ? 256 : 192, th = 144;
+    gl_flush(); gl_state_dirty(); efb_resolve();
+    if (!g_thfbo || g_thw != tw) {
+        if (!g_thfbo) { glGenFramebuffers(1, &g_thfbo); glGenTextures(1, &g_thtex); }
+        glBindTexture(GL_TEXTURE_2D, g_thtex); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_thfbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_thtex, 0);
+        g_thw = tw; g_thh = th;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_thfbo);
+    glBlitFramebuffer(0, YS(EFB_H - 480), SW, SH, 0, 0, tw, th, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
+}
+/* rows top-down, alpha opaque; returns 0 when there is no picture yet */
+int gl_thumb_read(u8* out, int cap, int* w, int* h) {
+    if (!g_thfbo || g_thw * g_thh * 4 > cap) return 0;
+    u8* tmp = malloc((size_t)g_thw * g_thh * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_thfbo); glReadPixels(0, 0, g_thw, g_thh, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+    for (int r = 0; r < g_thh; r++) memcpy(out + (size_t)r * g_thw * 4, tmp + (size_t)(g_thh - 1 - r) * g_thw * 4, (size_t)g_thw * 4);
+    for (int i = 0; i < g_thw * g_thh; i++) out[4 * i + 3] = 255;
+    free(tmp); glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); gl_state_dirty();
+    *w = g_thw; *h = g_thh; return 1;
+}
 void ui_rect(float x, float y, float w, float h, const float* ct, const float* cb) { ui_mode(0, 0); ui_quad(x, y, w, h, 0, 0, 0, 0, ct, cb); }
 void ui_title(float x, float y, float w, float h, float a) { float c[4] = {1, 1, 1, a}; ui_mode(1, g_utitle); ui_quad(x, y, w, h, 0, 0, 1, 1, c, c); }
 float ui_text_width(const char* s, float size) { float k = size / 26.f, x = 0; for (; *s; s++) { int ch = (unsigned char)*s - 32; if (ch >= 0 && ch < 95) x += g_uifont_adv[ch] * k; } return x; }
@@ -868,6 +905,76 @@ void gl_save_real(void) {
     glBlitFramebuffer(0, 0, SW, SH, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
 }
+
+/* ---------------- output: scaling and post-processing (options) ---------------- */
+static const char* PVS = "#version 330 core\nuniform vec4 u_dst; out vec2 v_t;\nvoid main(){ vec2 p=vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); v_t=p; gl_Position=vec4(u_dst.xy+p*u_dst.zw,0.0,1.0); gl_ClipDistance[0]=1.0; gl_ClipDistance[1]=1.0; gl_ClipDistance[2]=1.0; gl_ClipDistance[3]=1.0; }\n";
+static const char* PFS =
+"#version 330 core\n"
+"uniform sampler2D u_src; uniform vec4 u_srect; uniform vec2 u_texel; uniform vec2 u_out; uniform int u_mode; in vec2 v_t; out vec4 o;\n"
+"vec3 S(vec2 t){ return texture(u_src, u_srect.xy + clamp(t,0.0,1.0)*u_srect.zw).rgb; }\n"
+"float L(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }\n"
+"void main(){\n"
+"  vec2 t=v_t; vec2 px=u_texel/u_srect.zw;\n"
+"  if(u_mode==1){\n"   /* FXAA (simplified FXAA 3.11 console) */
+"    vec3 rgbM=S(t); float lM=L(rgbM);\n"
+"    float lNW=L(S(t+vec2(-1,-1)*px)), lNE=L(S(t+vec2(1,-1)*px)), lSW=L(S(t+vec2(-1,1)*px)), lSE=L(S(t+vec2(1,1)*px));\n"
+"    float lMin=min(lM,min(min(lNW,lNE),min(lSW,lSE))), lMax=max(lM,max(max(lNW,lNE),max(lSW,lSE)));\n"
+"    vec2 dir=vec2(-((lNW+lNE)-(lSW+lSE)), ((lNW+lSW)-(lNE+lSE)));\n"
+"    float red=max((lNW+lNE+lSW+lSE)*0.03125, 1.0/128.0); float rcp=1.0/(min(abs(dir.x),abs(dir.y))+red);\n"
+"    dir=clamp(dir*rcp, vec2(-8.0), vec2(8.0))*px;\n"
+"    vec3 a=0.5*(S(t+dir*(1.0/3.0-0.5))+S(t+dir*(2.0/3.0-0.5)));\n"
+"    vec3 b=a*0.5+0.25*(S(t+dir*-0.5)+S(t+dir*0.5)); float lB=L(b);\n"
+"    o=vec4((lB<lMin||lB>lMax)?a:b,1.0); return; }\n"
+"  if(u_mode==2){\n"   /* sharpen: contrast-adaptive, after AMD CAS */
+"    vec3 c=S(t), n=S(t+vec2(0,-1)*px), s=S(t+vec2(0,1)*px), w=S(t+vec2(-1,0)*px), e=S(t+vec2(1,0)*px);\n"
+"    vec3 mn=min(c,min(min(n,s),min(w,e))), mx=max(c,max(max(n,s),max(w,e)));\n"
+"    vec3 amp=sqrt(clamp(min(mn,1.0-mx)/max(mx,1e-4),0.0,1.0)); vec3 wgt=-amp/mix(8.0,5.0,0.6);\n"
+"    o=vec4(clamp((c+(n+s+w+e)*wgt)/(1.0+4.0*wgt),0.0,1.0),1.0); return; }\n"
+"  if(u_mode==3){\n"   /* CRT: slight curvature, scanlines at the game's 480 lines, aperture mask, vignette */
+"    vec2 q=t*2.0-1.0; q*=1.0+vec2(q.y*q.y,q.x*q.x)*vec2(0.035,0.045); vec2 tc=q*0.5+0.5;\n"
+"    if(tc.x<0.0||tc.x>1.0||tc.y<0.0||tc.y>1.0){ o=vec4(0,0,0,1); return; }\n"
+"    vec3 c=S(tc); float line=tc.y*240.0; float sl=0.62+0.38*pow(abs(sin(line*3.14159265)),1.6);\n"
+"    float m=mod(gl_FragCoord.x,3.0); vec3 mask=m<1.0?vec3(1.08,0.94,0.94):m<2.0?vec3(0.94,1.08,0.94):vec3(0.94,0.94,1.08);\n"
+"    float v=clamp(1.0-0.20*dot(q,q),0.0,1.0); o=vec4(pow(c,vec3(0.95))*sl*mask*v*1.18,1.0); return; }\n"
+"  o=vec4(S(t),1.0); }\n";
+static GLuint g_pprog, g_pvao; static GLint up_dst, up_srect, up_texel, up_out, up_mode, up_src;
+/* draws the game picture into (dx,dy,dw,dh) of the default framebuffer with the chosen filter; 0 = not handled */
+static GLuint g_post_target;   /* 0 = the window (tests draw into their own framebuffer) */
+static int post_draw(GLuint src_tex, int sw, int sh, int y0, int dx, int dy, int dw, int dh, int w, int h, int mode) {
+    if (!g_pprog) {
+        GLuint vs = compile(GL_VERTEX_SHADER, PVS), fs = compile(GL_FRAGMENT_SHADER, PFS);
+        g_pprog = glCreateProgram(); glAttachShader(g_pprog, vs); glAttachShader(g_pprog, fs); glLinkProgram(g_pprog);
+        GLint ok; glGetProgramiv(g_pprog, GL_LINK_STATUS, &ok); if (!ok) { rt_log("GL: post shader link failed\n"); g_pprog = 0xFFFFFFFFu; }
+        if (ok) { up_dst = glGetUniformLocation(g_pprog, "u_dst"); up_srect = glGetUniformLocation(g_pprog, "u_srect"); up_texel = glGetUniformLocation(g_pprog, "u_texel");
+                  up_out = glGetUniformLocation(g_pprog, "u_out"); up_mode = glGetUniformLocation(g_pprog, "u_mode"); up_src = glGetUniformLocation(g_pprog, "u_src"); glGenVertexArrays(1, &g_pvao); }
+    }
+    if (g_pprog == 0xFFFFFFFFu) return 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, g_post_target); glViewport(0, 0, w, h); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_COLOR_LOGIC_OP); glColorMask(1, 1, 1, 1);
+    glUseProgram(g_pprog); glBindVertexArray(g_pvao);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, src_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glUniform1i(up_src, 0); glUniform1i(up_mode, mode);
+    /* the picture is rows y0..sh of the texture, stored bottom-up: map v_t (0 = top) onto them */
+    { float r[4] = {0.f, 1.f, 1.f, -(float)(sh - y0) / sh}; glUniform4fv(up_srect, 1, r); }
+    { float tx[2] = {1.f / sw, 1.f / sh}; glUniform2fv(up_texel, 1, tx); }
+    { float o2[2] = {(float)dw, (float)dh}; glUniform2fv(up_out, 1, o2); }
+    { float d[4] = {2.f * dx / w - 1.f, 1.f - 2.f * dy / h, 2.f * dw / w, -2.f * dh / h}; glUniform4fv(up_dst, 1, d); }
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glUseProgram(g_prog); glBindVertexArray(g_vao); gl_state_dirty();
+    return 1;
+}
+/* test: SOA_POSTTEST=frame,mode renders the output filter at 1280x960 into postN.png */
+void gl_post_test(int mode, const char* path) {
+    gl_flush(); efb_resolve();
+    int w = 1280, h = 960; GLuint f, t; glGenFramebuffers(1, &f); glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0); glBindFramebuffer(GL_FRAMEBUFFER, f); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+    g_post_target = f; post_draw(g_fbtex, SW, SH, YS(EFB_H - 480), 0, 0, w, h, w, h, mode); g_post_target = 0;
+    u8* px = malloc((size_t)w * h * 4); u8* fl = malloc((size_t)w * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, f); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    for (int r = 0; r < h; r++) memcpy(fl + (size_t)r * w * 4, px + (size_t)(h - 1 - r) * w * 4, (size_t)w * 4);
+    extern int stbi_write_png(char const*, int, int, int, const void*, int); stbi_write_png(path, w, h, 4, fl, w * 4);
+    free(px); free(fl); glDeleteFramebuffers(1, &f); glDeleteTextures(1, &t); glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); gl_state_dirty();
+}
 void gl_show_saved(int on) { g_show_saved = on; }
 /* F12: screenshot of the game picture at the internal resolution (no overlays) */
 void gl_take_screenshot(void) {
@@ -892,9 +999,17 @@ void gl_blit_to_screen(int w, int h) {
     glViewport(0, 0, w, h); glClearColor(0, 0, 0, 1); glColorMask(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
     int an = g_ws ? 16 : 4, ad = g_ws ? 9 : 3;
     int dw = w, dh = w * ad / an; if (dh > h) { dh = h; dw = h * an / ad; }
+    static int pmode = -1, ints = -1; static u64 chk; if (pmode < 0 || g_gl_frame - chk > 60) { pmode = settings_get("post_filter", 0); ints = settings_get("integer_scaling", 0); chk = g_gl_frame; }
+    if (ints) {   /* whole multiples of the game's 480 lines (width follows the aspect) */
+        int k = h / 480; if (k < 1) k = 1; int iw = 640 * k * an / 4 / (ad / 3); if (g_ws) iw = 640 * k * 4 / 3;
+        while (k > 1 && (iw > w || 480 * k > h)) { k--; iw = g_ws ? 640 * k * 4 / 3 : 640 * k; }
+        if (iw <= w && 480 * k <= h) { dw = iw; dh = 480 * k; }
+    }
     int dx = (w - dw) / 2, dy = (h - dh) / 2;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
-    glBlitFramebuffer(0, YS(EFB_H - 480), SW, SH, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (!pmode || !post_draw(g_show_saved && g_sfbo ? g_stex : g_fbtex, SW, SH, YS(EFB_H - 480), dx, h - dy - dh, dw, dh, w, h, pmode)) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
+        glBlitFramebuffer(0, YS(EFB_H - 480), SW, SH, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, ints ? GL_NEAREST : GL_LINEAR);
+    }
     gl_take_screenshot();
     if (options_is_open()) { glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h); float ow = dh * 4.f / 3.f; options_draw(dx + (dw - ow) / 2, (float)(h - dy - dh), ow, (float)dh); ui_end(); }
     { extern int g_perf_overlay; extern char g_perf_text[3][200];

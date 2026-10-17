@@ -153,6 +153,9 @@ void f_8010D8E4(Ctx* c) {
     { static int lg = -1; if (lg < 0) lg = getenv("SOA_TXTLOG") ? 300 : 0; if (lg > 0 && (s16)R16(o + 2) == 1) { lg--; u32 i = R32(c->r[13] - 29004), st = R32(0x803150E0u + i * 4); rt_log("text: obj %08X flags %04X state %d len %d shown %d speed %d style %u/%08X typing %d\n", o, R16(o), (s16)R16(o + 2), (s16)R16(o + 54), (s16)R16(o + 56), g_text_speed, i, st ? R32(st + 8) : 0, typing); } }
     if (typing && g_text_speed >= 2) W16(o, R16(o) | 0x20);
     r_8010D8E4(c);
+    { static int lg = -1; static u32 pk; if (lg < 0) lg = getenv("SOA_TXTLOG2") ? 400 : 0;
+      u32 k = R16(o) << 16 | (R16(o + 2) & 0xFF) << 8 | (c->r[3] & 0xFF);
+      if (lg > 0 && k != pk) { lg--; pk = k; extern int g_frame_no_pub; rt_log("msg f%d obj %08X flags %04X state %d ret %d len %d shown %d +3C %04X +3E %04X +54.. %08X\n", g_frame_no_pub, o, R16(o), (s16)R16(o + 2), (int)c->r[3], (s16)R16(o + 54), (s16)R16(o + 56), R16(o + 60), R16(o + 62), R32(o + 64)); } }
     if (typing && g_text_speed == 1 && !(R16(o + 0) & 0x20) && (s16)R16(o + 2) == 1 && (s16)R16(o + 56) < (s16)R16(o + 54)) {
         u32 r3 = c->r[3]; c->r[3] = o; r_8010D8E4(c); c->r[3] = r3;   /* a second character this frame */
     }
@@ -186,7 +189,14 @@ static void hud_call(Ctx* c, void (*fn)(Ctx*), int mode) {
 }
 void f_80027D78(Ctx* c) { hud_call(c, r_80027D78, 3); }
 void f_800230E8(Ctx* c) { hud_call(c, r_800230E8, 2); }
-void f_80025798(Ctx* c) { hud_call(c, r_80025798, 2); }
+void f_80025798(Ctx* c) { extern u64 g_frames, g_cmd_frame; g_cmd_frame = g_frames; hud_call(c, r_80025798, 2); }
 static void hud_text_x(Ctx* c) { extern int g_hud_anchor; if (g_hud_anchor >= 2) { s32 x = (s16)c->r[3]; c->r[3] = (u32)(x + (x < 320 ? 4096 : 8192)); } }
 void f_801E4AC8(Ctx* c) { hud_text_x(c); r_801E4AC8(c); }
 void f_801E4730(Ctx* c) { hud_text_x(c); r_801E4730(c); }
+
+/* ---- battle detection (battle speed option) ----
+   fn_8000A1B4 runs every frame while a battle is on (battle draw root); the command ring (fn_80025798, see
+   the HUD hooks) is drawn while the game waits for the player's command. */
+void r_8000A1B4(Ctx* c);
+u64 g_battle_frame, g_cmd_frame;
+void f_8000A1B4(Ctx* c) { extern u64 g_frames; g_battle_frame = g_frames; r_8000A1B4(c); }

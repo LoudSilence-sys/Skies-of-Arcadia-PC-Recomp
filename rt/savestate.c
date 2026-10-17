@@ -110,6 +110,7 @@ static volatile int g_req;       /* 1 = save, 2 = load */
 static u64 g_req_at;
 static int g_slot = -1;
 static volatile int g_writing;
+static int g_save_slot, g_load_slot;   /* a slot picked on the states page (0 = the current slot) */
 
 static void slot_path(int slot, char* out, int cap) { snprintf(out, cap, "States/GEAP8P.s%02d", slot); }
 int quickstate_get_slot(void) { if (g_slot < 0) { g_slot = settings_get("quickstate_slot", 1); if (g_slot < 1 || g_slot > NSLOT) g_slot = 1; } return g_slot; }
@@ -120,13 +121,20 @@ void quickstate_slot(int d) {
     if (!stat(p, &st)) { char ts[40]; strftime(ts, sizeof ts, "%d %b %H:%M", localtime(&st.st_mtime)); osd_message("State slot %d  (saved %s)", s, ts); }
     else osd_message("State slot %d  (empty)", s);
 }
+/* the states page: save to / load from a given slot */
+void quickstate_request_slot(int load, int slot) { if (g_req) return; if (load) g_load_slot = slot; else g_save_slot = slot; quickstate_request(load); }
+int quickstate_slot_info(int slot, char* when, int cap) {   /* 1 when the slot holds a state; when = its date */
+    char p[64]; slot_path(slot, p, sizeof p); struct stat st; if (stat(p, &st)) return 0;
+    strftime(when, cap, "%d %b %H:%M", localtime(&st.st_mtime)); return 1;
+}
+void quickstate_slot_path(int slot, char* out, int cap) { slot_path(slot, out, cap); }
 void quickstate_request(int load) {
     if (g_req) return;
     if (!load && g_writing) { osd_message("Still writing the last state..."); return; }
     g_req = load ? 2 : 1; g_req_at = host_tb();
 }
 
-typedef struct { u8* raw; u64 len; Hdr h; int slot; } Job;
+typedef struct { u8* raw; u64 len; Hdr h; int slot; u8* thumb; int tw, th; } Job;
 static void* writer(void* a) {
     Job* j = a; int clen = 0;
     unsigned char* z = stbi_zlib_compress(j->raw, (int)j->len, &clen, 5);
@@ -138,6 +146,12 @@ static void* writer(void* a) {
         if (ok) { remove(p); ok = rename(tmp, p) == 0; }
         free(z);
     }
+    if (ok && j->thumb) {   /* thumbnail for the states page */
+        extern int stbi_write_png(char const*, int, int, int, const void*, int);
+        char tp[80]; snprintf(tp, sizeof tp, "%s.png", p); stbi_write_png(tp, j->tw, j->th, 4, j->thumb, j->tw * 4);
+    }
+    free(j->thumb);
+    { extern void states_page_dirty(void); states_page_dirty(); }
     if (ok) osd_message("Saved state to slot %d", j->slot); else osd_message("Saving the state failed (could not write %s)", p);
     rt_log("quickstate: slot %d saved: %llu bytes raw, %d compressed\n", j->slot, (unsigned long long)j->len, clen);
     free(j->raw); free(j); g_writing = 0;
@@ -158,7 +172,8 @@ static void do_save(Ctx* c) {
     memcpy(j->h.magic, SS_MAGIC, 8); j->h.version = SS_VERSION; j->h.hdr_size = sizeof j->h;
     j->h.raw_size = s.len; j->h.game_tb = s.now + g_tb_off; j->h.sp = c->r[1]; j->h.nchain = guest_chain(c, j->h.chain); j->h.resumable = chain_resumable(j->h.chain, j->h.nchain);
     j->h.saved_at = (s64)time(0); { extern int g_frame_no_pub; j->h.frame = g_frame_no_pub; }
-    j->raw = s.buf; j->len = s.len; j->slot = quickstate_get_slot();
+    j->raw = s.buf; j->len = s.len; j->slot = g_save_slot > 0 ? g_save_slot : quickstate_get_slot(); g_save_slot = 0;
+    { extern int g_use_gl; extern int gl_thumb_read(u8*, int, int*, int*); j->thumb = malloc(256 * 144 * 4); if (!g_use_gl || !gl_thumb_read(j->thumb, 256 * 144 * 4, &j->tw, &j->th)) { free(j->thumb); j->thumb = 0; } }
 #ifdef _WIN32
     mkdir("States");
 #else
@@ -257,7 +272,7 @@ void rs_run(Ctx* c, GuestFn entry, u32 entry_addr) {
 }
 
 static void do_load(Ctx* c) {
-    int slot = quickstate_get_slot(); char p[64]; slot_path(slot, p, sizeof p);
+    int slot = g_load_slot > 0 ? g_load_slot : quickstate_get_slot(); g_load_slot = 0; char p[64]; slot_path(slot, p, sizeof p);
     FILE* f = fopen(p, "rb"); if (!f) { osd_message("Slot %d is empty", slot); return; }
     Hdr h; long fl = 0; u8* z = 0; int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, SS_MAGIC, 8);
     if (ok && (h.version != SS_VERSION || h.hdr_size != sizeof h)) { fclose(f); osd_message("Slot %d was saved by a different version and can't be loaded", slot); return; }
@@ -282,6 +297,88 @@ static void do_load(Ctx* c) {
     __builtin_longjmp(g_top, 1);
 }
 
+
+/* ---------------- rewind ----------------
+   With rewind on (options), a snapshot is taken at the save point every 2 seconds. Only the newest is kept
+   whole; each older one is the XOR difference to its successor, run-length coded (most memory does not change
+   in 2 s), so 30 steps (one minute) cost little more than one state. Holding the rewind key steps back. */
+int g_rewind_held;
+#define RWMAX 30
+typedef struct { u8* d; u64 n; u64 game_tb; u32 sp, nchain, chain[CHAIN]; } RwStep;
+static RwStep g_rw[RWMAX]; static int g_rw_n;
+static u8* g_rw_raw; static u64 g_rw_len; static RwStep g_rw_cur;   /* the newest snapshot and its call chain */
+static u64 g_rw_last, g_rw_step_at;
+static void rw_join(void);
+static void rw_free_all(void) { rw_join(); for (int i = 0; i < g_rw_n; i++) free(g_rw[i].d); g_rw_n = 0; free(g_rw_raw); g_rw_raw = 0; g_rw_len = 0; }
+/* run-length code a ^ b: [u32 zeros][u32 n][n bytes]... */
+static u8* xor_rle(const u8* a, const u8* b, u64 len, u64* out_n) {
+    u64 cap = 1 << 20, n = 0; u8* o = malloc(cap);
+    u64 i = 0;
+    while (i < len) {
+        u64 z = i; while (z + 8 <= len && *(const u64*)(a + z) == *(const u64*)(b + z)) z += 8; while (z < len && a[z] == b[z]) z++;
+        u64 zr = z - i; i = z; if (i >= len && !zr) break;
+        u64 e = i; while (e < len) { if (e + 8 <= len && *(const u64*)(a + e) == *(const u64*)(b + e)) break; e++; }
+        if (zr > 0xFFFFFFFFu || e - i > 0xFFFFFFFFu) { free(o); return 0; }
+        u64 need = n + 8 + (e - i); if (need > cap) { while (cap < need) cap *= 2; o = realloc(o, cap); }
+        u32 h[2] = {(u32)zr, (u32)(e - i)}; memcpy(o + n, h, 8); n += 8;
+        for (u64 k = i; k < e; k++) o[n++] = a[k] ^ b[k];
+        i = e;
+    }
+    *out_n = n; return realloc(o, n ? n : 1);
+}
+static void xor_apply(u8* dst, u64 len, const u8* d, u64 n) {
+    u64 i = 0, p = 0;
+    while (p + 8 <= n) { u32 h[2]; memcpy(h, d + p, 8); p += 8; i += h[0]; for (u32 k = 0; k < h[1] && i < len; k++) dst[i++] ^= d[p++]; }
+}
+/* the difference is computed on a worker thread (the snapshot itself is a plain copy on the game thread) */
+typedef struct { u8* newer; u8* older; u64 len; RwStep meta; } RwJob;
+static pthread_t g_rw_th; static int g_rw_busy; static RwJob g_rw_job;
+static void* rw_worker(void* a) {
+    RwJob* j = a; RwStep st = j->meta; st.d = xor_rle(j->newer, j->older, j->len, &st.n);
+    free(j->older);
+    if (st.d) {
+        if (g_rw_n == RWMAX) { free(g_rw[0].d); memmove(g_rw, g_rw + 1, sizeof g_rw[0] * (RWMAX - 1)); g_rw_n--; }
+        g_rw[g_rw_n++] = st;
+    }
+    return 0;
+}
+static void rw_join(void) { if (g_rw_busy) { pthread_join(g_rw_th, 0); g_rw_busy = 0; } }
+static void rewind_snapshot(Ctx* c) {
+    rw_join();
+    SS s = {0}; s.now = host_tb(); all_state(&s, c);
+    if (s.err) { free(s.buf); return; }
+    RwStep cur = {0}; cur.game_tb = s.now + g_tb_off; cur.sp = c->r[1]; cur.nchain = guest_chain(c, cur.chain);
+    if (g_rw_raw && g_rw_len == s.len) {
+        g_rw_job.newer = s.buf; g_rw_job.older = g_rw_raw; g_rw_job.len = s.len; g_rw_job.meta = g_rw_cur;
+        if (pthread_create(&g_rw_th, 0, rw_worker, &g_rw_job)) rw_worker(&g_rw_job); else g_rw_busy = 1;
+    } else rw_free_all();
+    g_rw_raw = s.buf; g_rw_len = s.len; g_rw_cur = cur;
+}
+static void rewind_tick(Ctx* c) {
+    static int on = -1; static u64 chk; extern u64 g_frames;
+    if (on < 0 || g_frames - chk > 100) { on = settings_get("rewind", 0); chk = g_frames; if (!on && g_rw_raw) rw_free_all(); }
+    if (!on) return;
+    u64 now = host_tb();
+    { static int a = -2, b; extern int g_frame_no_pub; if (a == -2) { a = -1; const char* e = getenv("SOA_REWIND"); if (e) sscanf(e, "%d,%d", &a, &b); }
+      if (a >= 0) g_rewind_held = g_frame_no_pub >= a && g_frame_no_pub < b; }   /* test: hold rewind between these frames */
+    if (g_rewind_held) {
+        if (now - g_rw_step_at < 40500000ull * 2 / 5) return;   /* one step every 0.4 s while held */
+        g_rw_step_at = now;
+        rw_join();
+        if (!g_rw_n) { osd_message("Can't rewind any further"); return; }
+        u32 ch[CHAIN]; u32 n = guest_chain(c, ch);
+        RwStep* st = &g_rw[g_rw_n - 1];
+        if (st->sp != c->r[1] || st->nchain != n || memcmp(st->chain, ch, n * 4)) { osd_message("Can't rewind past this point"); return; }
+        xor_apply(g_rw_raw, g_rw_len, st->d, st->n);
+        Hdr h = {0}; h.game_tb = st->game_tb;
+        if (!apply_state(c, (char*)g_rw_raw, (int)g_rw_len, &h, 0)) { rw_free_all(); return; }
+        g_rw_cur = *st; free(st->d); g_rw_n--;
+        osd_message("Rewind: %d s", 2 * g_rw_n);
+        g_rw_last = now;
+        return;
+    }
+    if (now - g_rw_last >= 40500000ull * 2) { g_rw_last = now; rewind_snapshot(c); }
+}
 /* called at the end-of-frame wait in the main loop */
 void quickstate_poll(Ctx* c) {
     {   /* tests: SOA_QSAVE / SOA_QLOAD = frame numbers (comma separated) */
@@ -296,6 +393,7 @@ void quickstate_poll(Ctx* c) {
         g_resuming = 0; g_rs_n = 0; loaded_message(&g_x_h, g_x_slot);
         return;
     }
+    rewind_tick(c);
     if (!g_req) return;
     int r = g_req; g_req = 0;
     if (r == 1) do_save(c); else do_load(c);

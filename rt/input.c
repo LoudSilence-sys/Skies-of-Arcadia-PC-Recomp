@@ -52,6 +52,7 @@ static Bind g_bind[IN_N] = {
     [IN_CLEFT] = {"C-Stick Left", "cleft", 'J', 0, 0},
     [IN_CRIGHT] = {"C-Stick Right", "cright", 'L', 0, 0},
     [IN_FF] = {"Fast-Forward", "ff", 0x09, XB_RS, XB_RS},
+    [IN_REWIND] = {"Rewind", "rewind", 0x08, XB_BACK, XB_BACK},
 };
 static int g_loaded;
 static void load(void) {
@@ -80,7 +81,7 @@ void input_set_pad(int a, u32 b) {
 void input_set_layout(int gc) {
     load(); settings_set("pad_layout", gc);
     static const u32 xb[IN_N] = {[IN_A] = XB_A, [IN_B] = XB_B, [IN_X] = XB_X, [IN_Y] = XB_Y, [IN_START] = XB_START, [IN_Z] = XB_RB, [IN_L] = XB_LT, [IN_R] = XB_RT,
-        [IN_DUP] = XB_DUP, [IN_DDOWN] = XB_DDOWN, [IN_DLEFT] = XB_DLEFT, [IN_DRIGHT] = XB_DRIGHT, [IN_FF] = XB_RS};
+        [IN_DUP] = XB_DUP, [IN_DDOWN] = XB_DDOWN, [IN_DLEFT] = XB_DLEFT, [IN_DRIGHT] = XB_DRIGHT, [IN_FF] = XB_RS, [IN_REWIND] = XB_BACK};
     for (int i = 0; i < IN_N; i++) {
         u32 b = xb[i]; if (gc && i == IN_B) b = XB_X; else if (gc && i == IN_X) b = XB_B;
         char k[32]; snprintf(k, sizeof k, "pad_%s", g_bind[i].key); g_bind[i].pad = b; settings_set(k, (int)b);
@@ -89,7 +90,7 @@ void input_set_layout(int gc) {
 void input_reset_keys(void) {
     static const int def[IN_N] = {[IN_A] = 'Z', [IN_B] = 'X', [IN_X] = 'C', [IN_Y] = 'V', [IN_START] = 0x0D, [IN_Z] = 'E', [IN_L] = 'Q', [IN_R] = 'W',
         [IN_DUP] = 'T', [IN_DDOWN] = 'G', [IN_DLEFT] = 'F', [IN_DRIGHT] = 'H', [IN_SUP] = 0x26, [IN_SDOWN] = 0x28, [IN_SLEFT] = 0x25, [IN_SRIGHT] = 0x27,
-        [IN_CUP] = 'I', [IN_CDOWN] = 'K', [IN_CLEFT] = 'J', [IN_CRIGHT] = 'L', [IN_FF] = 0x09};
+        [IN_CUP] = 'I', [IN_CDOWN] = 'K', [IN_CLEFT] = 'J', [IN_CRIGHT] = 'L', [IN_FF] = 0x09, [IN_REWIND] = 0x08};
     load();
     for (int i = 0; i < IN_N; i++) { char k[32]; snprintf(k, sizeof k, "key_%s", g_bind[i].key); g_bind[i].vk = def[i]; settings_set(k, def[i]); }
 }
@@ -109,7 +110,20 @@ const char* input_key_label(int vk) {
     if (vk >= 0x70 && vk <= 0x87) { snprintf(b, sizeof b, "F%d", vk - 0x6F); return b; }
     snprintf(b, sizeof b, "Key %02X", vk); return b;
 }
+int g_pad_type;      /* controller family: 0 none, 1 Xbox, 2 PlayStation, 3 Switch, 4 GameCube (platform layer) */
+int g_last_device;   /* 0 keyboard, 1 controller: the last one used */
 const char* input_pad_label(u32 b) {
+    if (g_pad_type == 2) switch (b) {
+    case XB_A: return "Cross"; case XB_B: return "Circle"; case XB_X: return "Square"; case XB_Y: return "Triangle"; case XB_START: return "Options"; case XB_BACK: return "Create";
+    case XB_LB: return "L1"; case XB_RB: return "R1"; case XB_LT: return "L2"; case XB_RT: return "R2"; case XB_LS: return "L3"; case XB_RS: return "R3";
+    }
+    if (g_pad_type == 3) switch (b) {   /* positions: bottom, right, left, top */
+    case XB_A: return "B (bottom)"; case XB_B: return "A (right)"; case XB_X: return "Y (left)"; case XB_Y: return "X (top)"; case XB_START: return "+"; case XB_BACK: return "-";
+    case XB_LB: return "L"; case XB_RB: return "R"; case XB_LT: return "ZL"; case XB_RT: return "ZR"; case XB_LS: return "L-Stick Click"; case XB_RS: return "R-Stick Click";
+    }
+    if (g_pad_type == 4) switch (b) {
+    case XB_START: return "Start"; case XB_RB: return "Z"; case XB_LT: return "L"; case XB_RT: return "R";
+    }
     switch (b) {
     case XB_A: return "A"; case XB_B: return "B"; case XB_X: return "X"; case XB_Y: return "Y"; case XB_START: return "Menu"; case XB_BACK: return "View";
     case XB_LB: return "LB"; case XB_RB: return "RB"; case XB_LT: return "LT"; case XB_RT: return "RT"; case XB_LS: return "L-Stick Click"; case XB_RS: return "R-Stick Click";
@@ -150,5 +164,91 @@ void input_build(const u8* keys, long xb, int lt, int rt, int lx, int ly, int rx
     *hi = b0 << 24 | b1 << 16 | (u32)sx << 8 | sy;
     *lo = (u32)cx << 24 | (u32)cy << 16 | (u32)tl << 8 | tr;
     *ff = D(IN_FF);
+    { extern int g_rewind_held; g_rewind_held = D(IN_REWIND); }
 #undef D
+}
+
+/* ---------------- button names in the game's text ----------------
+   The game names its buttons in words ("Press the A Button to continue"). Every second the RAM is scanned for
+   "<X> Button" and rewritten in place for the device in use: the bound controller button (Cross, Circle...)
+   or keyboard key. Replacements are never longer than the original; the rest of the string moves up and
+   the freed tail is cleared. Originals are kept so a device change can rewrite them again, and a string is
+   only touched while it still holds what we wrote (memory that was reused is left alone). */
+#include <stdlib.h>
+typedef struct { u32 addr, len; char orig[160]; char cur[160]; } TxtFix;
+static TxtFix* g_fx; static int g_fxn, g_fxcap;
+static int g_prompt_mode = -1;   /* settings button_prompts: 0 auto, 1 GameCube, 2 Xbox, 3 PlayStation, 4 Switch, 5 keyboard */
+void prompts_changed(void) { g_prompt_mode = -1; }
+static int game_button(char c) {
+    switch (c) { case 'A': return IN_A; case 'B': return IN_B; case 'X': return IN_X; case 'Y': return IN_Y; case 'Z': return IN_Z; case 'L': return IN_L; case 'R': return IN_R; }
+    return -1;
+}
+/* the name of game button a for this style; *word = 1 when "Button" should follow, 2 when "key" should */
+static const char* button_name(int a, int style, int* word) {
+    static char b[32]; *word = 0;
+    if (style == 5) { *word = 2; snprintf(b, sizeof b, "%s", input_key_label(input_key(a))); return b; }
+    u32 p = input_pad(a);
+    if (style == 3) { switch (p) { case XB_A: return "Cross"; case XB_B: return "Circle"; case XB_X: return "Square"; case XB_Y: return "Triangle";
+        case XB_LB: return "L1"; case XB_RB: return "R1"; case XB_LT: return "L2"; case XB_RT: return "R2"; case XB_START: return "Options"; } return 0; }
+    if (style == 4) { *word = 1; switch (p) { case XB_A: return "B"; case XB_B: return "A"; case XB_X: return "Y"; case XB_Y: return "X";
+        case XB_LB: return "L"; case XB_RB: return "R"; case XB_LT: return "ZL"; case XB_RT: return "ZR"; } return 0; }
+    if (style == 2) { *word = 1; switch (p) { case XB_A: return "A"; case XB_B: return "B"; case XB_X: return "X"; case XB_Y: return "Y";
+        case XB_LB: return "LB"; case XB_RB: return "RB"; case XB_LT: return "LT"; case XB_RT: return "RT"; } return 0; }
+    return 0;
+}
+static int prompt_style(void) {
+    static u64 chk; extern u64 g_frames;
+    if (g_prompt_mode < 0 || g_frames - chk > 100) { g_prompt_mode = settings_get("button_prompts", 0); chk = g_frames; }
+    if (g_prompt_mode) return g_prompt_mode;
+    if (g_last_device == 0) return 5;
+    return g_pad_type == 2 ? 3 : g_pad_type == 3 ? 4 : g_pad_type == 4 ? 1 : 2;
+}
+/* rewrite one string (orig) for a style into out (never longer) */
+static void rewrite(const char* orig, int len, int style, char* out) {
+    int o = 0;
+    for (int i = 0; i < len; ) {
+        int the = (i + 4 <= len && !memcmp(orig + i, "the ", 4)) ? 4 : 0;
+        int j = i + the;
+        if (j + 8 <= len && orig[j + 1] == ' ' && !memcmp(orig + j + 2, "Button", 6) && game_button(orig[j]) >= 0 && (j == 0 || orig[j - 1] == ' ' || orig[j - 1] == '\n' || the)) {
+            int word, span = the + 8; const char* nm = button_name(game_button(orig[j]), style, &word);
+            char rep[64] = "";
+            if (nm) {
+                if (word == 1) snprintf(rep, sizeof rep, "%s%s Button", the ? "the " : "", nm);
+                else if (word == 2) { snprintf(rep, sizeof rep, "%s%s key", the ? "the " : "", nm); if ((int)strlen(rep) > span) snprintf(rep, sizeof rep, "%s key", nm); if ((int)strlen(rep) > span) snprintf(rep, sizeof rep, "%s", nm); }
+                else snprintf(rep, sizeof rep, "%s", nm);
+            }
+            if (nm && (int)strlen(rep) <= span) { memcpy(out + o, rep, strlen(rep)); o += (int)strlen(rep); i += span; continue; }
+        }
+        out[o++] = orig[i++];
+    }
+    while (o < len) out[o++] = 0;
+}
+static u8* find7(u8* h, u32 n) {   /* " Button" */
+    for (u32 i = 0; i + 7 <= n; i++) { u8* q = memchr(h + i, 'B', n - i); if (!q) return 0; i = (u32)(q - h); if (i >= 1 && q[-1] == ' ' && i + 6 <= n && !memcmp(q, "Button", 6)) return q - 1; }
+    return 0;
+}
+void prompts_tick(void) {
+    static u64 last; extern u64 g_frames; if (g_frames - last < 50) return; last = g_frames;
+    int style = prompt_style();
+    /* find new strings */
+    for (u32 a = 0; a + 8 < RAM_SIZE; ) {
+        u8* p = find7(g_ram + a, RAM_SIZE - a); if (!p) break;
+        u32 at = (u32)(p - g_ram); a = at + 7;
+        if (at < 2 || game_button((char)g_ram[at - 1]) < 0) continue;
+        u32 s = at - 1; while (s > 0 && g_ram[s - 1] >= 0x20 && g_ram[s - 1] < 0x7F && at - s < 150) s--;
+        if (g_ram[s - 1] >= 0x20 && g_ram[s - 1] < 0x7F) continue;   /* not the start of a string */
+        u32 e = at; while (e < RAM_SIZE && g_ram[e] && e - s < 159) e++;
+        if (g_ram[e]) continue;
+        int known = 0; for (int k = 0; k < g_fxn; k++) if (g_fx[k].addr == s) { known = 1; break; }
+        if (known) continue;
+        if (g_fxn == g_fxcap) { g_fxcap = g_fxcap ? g_fxcap * 2 : 64; g_fx = realloc(g_fx, sizeof *g_fx * g_fxcap); }
+        TxtFix* f = &g_fx[g_fxn++]; f->addr = s; f->len = e - s; memcpy(f->orig, g_ram + s, f->len); f->orig[f->len] = 0; memcpy(f->cur, f->orig, f->len + 1);
+    }
+    /* (re)write them for the current style */
+    for (int k = 0; k < g_fxn; k++) {
+        TxtFix* f = &g_fx[k];
+        if (memcmp(g_ram + f->addr, f->cur, f->len)) { g_fx[k--] = g_fx[--g_fxn]; continue; }   /* memory reused: forget it */
+        char out[160]; if (style == 1) memcpy(out, f->orig, f->len); else rewrite(f->orig, (int)f->len, style, out);
+        if (memcmp(out, f->cur, f->len)) { memcpy(g_ram + f->addr, out, f->len); memcpy(f->cur, out, f->len); }
+    }
 }

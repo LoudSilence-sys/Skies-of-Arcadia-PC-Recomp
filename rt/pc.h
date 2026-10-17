@@ -5,7 +5,7 @@
 #endif
 /* input bindings (input.c) */
 enum { IN_A, IN_B, IN_X, IN_Y, IN_START, IN_Z, IN_L, IN_R, IN_DUP, IN_DDOWN, IN_DLEFT, IN_DRIGHT,
-       IN_SUP, IN_SDOWN, IN_SLEFT, IN_SRIGHT, IN_CUP, IN_CDOWN, IN_CLEFT, IN_CRIGHT, IN_FF, IN_N };
+       IN_SUP, IN_SDOWN, IN_SLEFT, IN_SRIGHT, IN_CUP, IN_CDOWN, IN_CLEFT, IN_CRIGHT, IN_FF, IN_REWIND, IN_N };
 void input_build(const u8* keys, long xb, int lt, int rt, int lx, int ly, int rx, int ry, u32* hi, u32* lo, int* ff);
 const char* input_name(int a); int input_key(int a); u32 input_pad(int a);
 void input_set_key(int a, int vk); void input_set_pad(int a, u32 b); void input_set_layout(int gc); void input_reset_keys(void);
