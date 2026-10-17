@@ -328,10 +328,10 @@ int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, 
     if (!e) { if (replay) return 1; e = old; e->used = 1; e->addr = a; e->cur = 0; e->start = -1; e->shadow = -1; }
     int slot;
     if (replay) {   /* the replay renders into its own version */
-        if (e->shadow < 0) { for (slot = 0; slot < 3 && (slot == e->start || slot == e->cur); slot++) ; e->shadow = slot < 3 ? slot : e->cur; }
+        if (e->shadow < 0) { for (slot = 0; slot < 3 && (slot == e->start || slot == e->cur); slot++) {} e->shadow = slot < 3 ? slot : e->cur; }
         slot = e->shadow;
     } else {
-        if (e->cur == e->start) { for (slot = 0; slot < 3 && slot == e->start; slot++) ; e->cur = slot; }   /* keep the frame-start version intact */
+        if (e->cur == e->start) { for (slot = 0; slot < 3 && slot == e->start; slot++) {} e->cur = slot; }   /* keep the frame-start version intact */
         slot = e->cur;
     }
     CopyVer* v = &e->v[slot];
