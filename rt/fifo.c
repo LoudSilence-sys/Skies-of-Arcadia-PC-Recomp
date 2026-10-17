@@ -137,3 +137,4 @@ void fifo_state(SS* s) {
     SSV(s, cp_vcd_lo); SSV(s, cp_vcd_hi); SSV(s, cp_vat_a); SSV(s, cp_vat_b); SSV(s, cp_vat_c); SSV(s, g_cp_regs);
     SSV(s, g_len); if (g_len > sizeof g_buf) { g_len = 0; s->err = 1; } ss_io(s, g_buf, g_len);
 }
+void fifo_import(const u32* cp) { for (int r = 0x30; r < 0xC0; r++) load_cp((u8)r, cp[r]); g_len = 0; }

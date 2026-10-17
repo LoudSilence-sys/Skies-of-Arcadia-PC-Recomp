@@ -288,7 +288,7 @@ static GLuint g_cprog, g_cvao; static GLint uc_src, uc_rect, uc_dsize, uc_fmt, u
 /* Each address keeps up to three versions of its copy: the current one, the one that was current when the
    frame started (frame interpolation replays a frame from its start, so it must see that one), and a shadow
    that the replay itself renders into. */
-typedef struct { u32 tw, th, tfmt, nbytes, rhash; GLuint tex, fbo; int gw, gh; } CopyVer;
+typedef struct { u32 tw, th, tfmt, nbytes, rhash; GLuint tex, fbo; int gw, gh; u32 gen; GLuint ctex, cfbo; u32 cw, ch, cgen; } CopyVer;
 typedef struct { u32 addr; CopyVer v[3]; int cur, start, shadow; u64 frame; int used; } CopyEnt;
 #define NCOPY 128
 static CopyEnt g_copies[NCOPY];
@@ -339,7 +339,7 @@ int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, 
         glBindFramebuffer(GL_FRAMEBUFFER, v->fbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, v->tex, 0);
         v->gw = gw; v->gh = gh;
     }
-    v->tw = tw; v->th = th; v->tfmt = copy_tex_fmt(fmt); v->nbytes = nbytes; e->frame = g_gl_frame;
+    v->tw = tw; v->th = th; v->tfmt = copy_tex_fmt(fmt); v->nbytes = nbytes; e->frame = g_gl_frame; v->gen++;
     v->rhash = sampled_hash(a, nbytes);
     glBindFramebuffer(GL_FRAMEBUFFER, v->fbo); glViewport(0, 0, gw, gh);
     glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_COLOR_LOGIC_OP); glColorMask(1, 1, 1, 1);
@@ -364,9 +364,27 @@ static GLuint copy_lookup(u32 addr, u32 w, u32 h, u32 fmt) {
         int slot = c->cur;
         if (gx_replaying()) slot = c->shadow >= 0 ? c->shadow : c->start >= 0 ? c->start : c->cur;
         CopyVer* v = &c->v[slot];
-        if (!v->tex || v->tw != w || v->th != h || v->tfmt != fmt) return 0;
+        if (!v->tex || v->tfmt != fmt || w < v->tw || h < v->th) return 0;
         if (sampled_hash(a, v->nbytes) != v->rhash) { if (!gx_replaying()) c->used = 0; return 0; }   /* overwritten by other data */
-        c->frame = g_gl_frame; return v->tex;
+        c->frame = g_gl_frame;
+        if (v->tw == w && v->th == h) return v->tex;
+        /* the copy fills the top-left of a larger texture (e.g. a 640x480 screen grab into a 1024x512 texture that
+           the battle transition warps): sample it from a texture of the full size with the copy in that corner */
+        if (!v->ctex || v->cw != w || v->ch != h || v->cgen != v->gen) {
+            int cw = (int)((u64)v->gw * w / v->tw), chh = (int)((u64)v->gh * h / v->th);
+            if (!v->ctex) { glGenTextures(1, &v->ctex); glGenFramebuffers(1, &v->cfbo); }
+            gl_state_dirty();   /* called while a draw is being set up (bind_tex): the rest of gl_flush_ re-applies its state */
+            glBindTexture(GL_TEXTURE_2D, v->ctex);
+            { void* z = calloc((size_t)cw * chh, 4); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cw, chh, 0, GL_RGBA, GL_UNSIGNED_BYTE, z); free(z); }
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, v->cfbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, v->ctex, 0);
+            glDisable(GL_SCISSOR_TEST);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, v->fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, v->cfbo);
+            glBlitFramebuffer(0, 0, v->gw, v->gh, 0, 0, v->gw, v->gh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
+            v->cw = w; v->ch = h; v->cgen = v->gen;
+        }
+        return v->ctex;
     }
     return 0;
 }
@@ -609,6 +627,7 @@ static void gl_flush_(void) {
     { int nind = (bp[0x00] >> 16) & 7; static int logged; if (nind && logged < 8) { logged++; rt_log("GL: indirect draw nind=%d iref=%06X cmd0=%06X cmd1=%06X mtx0=%06X %06X %06X\n", nind, bp[0x27], bp[0x10], bp[0x11], bp[0x06], bp[0x07], bp[0x08]); } for (int i = 0; i < nind && i < 4; i++) used |= 1u << ((bp[0x27] >> (6 * i)) & 7); }
     for (int s = 0; s < ns; s++) { u32 o = bp[0x28 + s / 2]; if (s & 1) o >>= 12; if ((o >> 6) & 1) used |= 1u << (o & 7); }
     for (int m = 0; m < 8; m++) if (used & (1u << m)) bind_tex(m);
+    if (!g_gs.valid) fresh = 1;   /* binding a texture may have had to render (copy_lookup) */
     glUniform2fv(u_texdim, 8, &g_texdim[0][0]);
     /* depth */
     u32 zm = bp[0x40];

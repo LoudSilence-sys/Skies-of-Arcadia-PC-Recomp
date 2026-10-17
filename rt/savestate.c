@@ -183,6 +183,51 @@ static void loaded_message(const Hdr* h, int slot) {
     rt_log("quickstate: slot %d loaded\n", slot);
 }
 
+
+/* ---------------- importing a Dolphin state ----------------
+   SOA_IMPORT=dir (with a base slot from this runtime) replaces CPU, RAM, ARAM, GX/CP registers and TMEM
+   with a dump that a patched Dolphin wrote when its CPU reached the same save point (0x801DE164). The base
+   state supplies everything Dolphin's dump does not (hardware registers, sound engine host state). Test use. */
+static void* read_all(const char* dir, const char* n, size_t want) {
+    char p[600]; snprintf(p, sizeof p, "%s/%s", dir, n); FILE* f = fopen(p, "rb"); if (!f) return 0;
+    void* b = calloc(1, want); size_t got = fread(b, 1, want, f); fclose(f); (void)got; return b;
+}
+static u32 bswap32(u32 v) { return v >> 24 | (v >> 8 & 0xFF00) | (v << 8 & 0xFF0000) | v << 24; }
+static int import_overlay(Ctx* c, const char* dir) {
+    char p[600]; snprintf(p, sizeof p, "%s/cpu.txt", dir); FILE* f = fopen(p, "r"); if (!f) return 0;
+    char k[32]; unsigned long long v, v2; u64 tb = 0; u32 dec = 0;
+    while (fscanf(f, "%31s %llx", k, &v) == 2) {
+        int i;
+        if (k[0] == 'r' && sscanf(k + 1, "%d", &i) == 1) c->r[i] = (u32)v;
+        else if (k[0] == 'f' && k[1] >= '0' && k[1] <= '9' && sscanf(k + 1, "%d", &i) == 1 && fscanf(f, "%llx", &v2) == 1) { memcpy(&c->f[i][0], &v, 8); memcpy(&c->f[i][1], &v2, 8); }
+        else if (!strncmp(k, "gqr", 3)) c->gqr[atoi(k + 3)] = (u32)v;
+        else if (!strncmp(k, "sprg", 4)) c->sprg[atoi(k + 4)] = (u32)v;
+        else if (k[0] == 's' && k[1] == 'r' && k[2] >= '0' && k[2] <= '9') c->sr[atoi(k + 2)] = (u32)v;
+        else if (!strcmp(k, "cr")) c->cr = (u32)v; else if (!strcmp(k, "ctr")) c->ctr = (u32)v; else if (!strcmp(k, "xer")) c->xer = (u32)v;
+        else if (!strcmp(k, "msr")) c->msr = (u32)v; else if (!strcmp(k, "fpscr")) c->fpscr = (u32)v;
+        else if (!strcmp(k, "hid0")) c->hid0 = (u32)v; else if (!strcmp(k, "hid2")) c->hid2 = (u32)v; else if (!strcmp(k, "hid4")) c->hid4 = (u32)v;
+        else if (!strcmp(k, "srr0")) c->srr0 = (u32)v; else if (!strcmp(k, "srr1")) c->srr1 = (u32)v; else if (!strcmp(k, "wpar")) c->wpar = (u32)v; else if (!strcmp(k, "l2cr")) c->l2cr = (u32)v;
+        else if (!strcmp(k, "tb")) tb = v; else if (!strcmp(k, "dec")) dec = (u32)v;
+    }
+    fclose(f);
+    c->lr = 0x801DE168;
+    u8* ram = read_all(dir, "ram_fixed.bin", RAM_SIZE); if (!ram) ram = read_all(dir, "ram.bin", RAM_SIZE);
+    u8* aram = read_all(dir, "aram.bin", 0x01000000); u32* bpv = read_all(dir, "bp.bin", 1024); u32* xfv = read_all(dir, "xf.bin", 0x1058 * 4);
+    u32* cp = read_all(dir, "cp.bin", 1024); u8* tm = read_all(dir, "tmem.bin", 1 << 20);
+    if (!ram || !aram || !bpv || !xfv || !cp || !tm) { free(ram); free(aram); free(bpv); free(xfv); free(cp); free(tm); return 0; }
+    memcpy(g_ram, ram, RAM_SIZE);
+    extern u8* g_aram; memcpy(g_aram, aram, 0x01000000);
+    /* Dolphin keeps BP/XF/CP as host-endian words: already what we use */
+    extern void gx_import(const u32*, const u32*, int, const u8*); gx_import(bpv, xfv, 0x1058, tm);
+    extern void fifo_import(const u32*); fifo_import(cp);
+    g_tb_off = (s64)(tb - host_tb());
+    extern void sched_set_dec(u32 v); sched_set_dec(dec);
+    free(ram); free(aram); free(bpv); free(xfv); free(cp); free(tm);
+    (void)bswap32;
+    rt_log("quickstate: imported Dolphin state from %s (pc lr %08X sp %08X)\n", dir, c->lr, c->r[1]);
+    return 1;
+}
+
 /* loading under a different call chain: unwind to rs_run, restore, re-enter the saved chain */
 static void* g_top[5]; static int g_top_set;
 static char* g_x_raw; static int g_x_len, g_x_slot; static Hdr g_x_h;
@@ -195,6 +240,12 @@ void rs_run(Ctx* c, GuestFn entry, u32 entry_addr) {
         int ok = apply_state(c, g_x_raw, g_x_len, &g_x_h, g_x_slot);
         free(g_x_raw); g_x_raw = 0;
         if (!ok) rt_fatal("quick load failed: slot %d is damaged\n", g_x_slot);
+        { const char* imp = getenv("SOA_IMPORT");
+          if (imp) {
+              if (!import_overlay(c, imp)) rt_fatal("import from %s failed\n", imp);
+              g_x_h.nchain = (u32)guest_chain(c, g_x_h.chain);
+              if (!chain_resumable(g_x_h.chain, (int)g_x_h.nchain)) rt_fatal("imported state: call chain not resumable\n");
+          } }
         for (u32 i = 0; i < g_x_h.nchain; i++) g_rs_ra[i] = g_x_h.chain[i];
         g_rs_len = g_x_h.nchain; g_rs_bad = 0; g_rs_ctx = *c; g_resuming = 1;
         g_rs_n = (int)g_rs_len;
@@ -215,7 +266,7 @@ static void do_load(Ctx* c) {
     if (!ok) { free(z); osd_message("Slot %d is damaged", slot); return; }
     u32 chain[CHAIN]; u32 n = guest_chain(c, chain);
     int same = h.sp == c->r[1] && h.nchain == n && n && !memcmp(h.chain, chain, n * 4);
-    if (getenv("SOA_QRESUME")) same = 0;   /* test: always take the re-entry path */
+    if (getenv("SOA_QRESUME") || getenv("SOA_IMPORT")) same = 0;   /* tests: always take the re-entry path */
     if (!same && (!h.resumable || !g_top_set)) {
         rt_log("quickstate: slot %d not resumable here (%u levels saved, %u now)\n", slot, h.nchain, n);
         free(z); osd_message("Slot %d can't be loaded here", slot); return;

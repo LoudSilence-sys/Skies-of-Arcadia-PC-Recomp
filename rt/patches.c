@@ -171,3 +171,22 @@ void f_800E28B4(Ctx* c) {
     r_800E28B4(c);
     g_hud_anchor = old;
 }
+
+/* Battle HUD: spirit gauge (fn_80027D78), character status (fn_800230E8), command ring (fn_80025798).
+   Their pieces move to the nearer screen edge and the gauge bar stretches across (g_hud_anchor = 2). Text
+   they queue (fn_801E4AC8 string, fn_801E4730 number) is drawn later from the main loop, so its x is tagged
+   with a large offset that the renderer recognises, removes and anchors (gx.c draw_out). */
+void r_80027D78(Ctx* c); void r_800230E8(Ctx* c); void r_80025798(Ctx* c); void r_801E4AC8(Ctx* c); void r_801E4730(Ctx* c);
+static void hud_call(Ctx* c, void (*fn)(Ctx*), int mode) {
+    if (g_ws_hud < 0) g_ws_hud = settings_get("ws_hud", 0);
+    extern int g_hud_anchor, g_ws; int old = g_hud_anchor;
+    if (g_ws_hud && g_ws) g_hud_anchor = mode;
+    fn(c);
+    g_hud_anchor = old;
+}
+void f_80027D78(Ctx* c) { hud_call(c, r_80027D78, 3); }
+void f_800230E8(Ctx* c) { hud_call(c, r_800230E8, 2); }
+void f_80025798(Ctx* c) { hud_call(c, r_80025798, 2); }
+static void hud_text_x(Ctx* c) { extern int g_hud_anchor; if (g_hud_anchor >= 2) { s32 x = (s16)c->r[3]; c->r[3] = (u32)(x + (x < 320 ? 4096 : 8192)); } }
+void f_801E4AC8(Ctx* c) { hud_text_x(c); r_801E4AC8(c); }
+void f_801E4730(Ctx* c) { hud_text_x(c); r_801E4730(c); }

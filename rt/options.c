@@ -91,7 +91,7 @@ enum { ACT_RESET_KEYS = 1, ACT_BACK };
 static Item P_DISPLAY[] = {
     CH("Resolution", "resolution_scale", 3, RES_V, RES_L, "Internal rendering resolution, as a multiple of the original 640x480.", ap_scale),
     CH("Widescreen (16:9)", "widescreen", 0, 0, OFFON, "Shows more of the world at the sides. Menus and text stay 4:3.", ap_wide),
-    CH("Widescreen HUD", "ws_hud", 0, 0, HUD_L, "In widescreen, the minimap sits in the corner of the 4:3 frame or of the whole screen.", ap_wshud),
+    CH("Widescreen HUD", "ws_hud", 0, 0, HUD_L, "In widescreen, the minimap and battle HUD sit at the screen edges instead of the 4:3 frame.", ap_wshud),
     {"Fullscreen", K_CHOICE, "fullscreen", 0, 2, 0, OFFON, "Borderless fullscreen. Alt+Enter or F11 also switches.", ap_full, get_full},
     CH("V-Sync", "vsync", 0, 0, OFFON, "Synchronise with the display to avoid tearing.", ap_vsync),
     CH("Refresh rate", "pal60", 1, 0, HZ_L, "60 Hz runs the game at full speed (PAL60). Applies after a restart.", ap_hz),

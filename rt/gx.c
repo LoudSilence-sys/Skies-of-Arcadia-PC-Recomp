@@ -756,13 +756,28 @@ static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int
                 for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; float x = vs[i].x / w; if (x < lo) lo = x; if (x > hi) hi = x; }
                 if (lo <= -0.98f && hi >= 0.98f) squeeze = 0;
             }
-            int anchor = 0;
-            if (squeeze && xf_reg[0x26] != 0 && g_hud_anchor) {   /* only pieces entirely on that side of the screen move */
-                anchor = g_hud_anchor;
-                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; if (vs[i].x / w * g_hud_anchor < 0.05f) anchor = 0; }
+            int anchor = 0, spread = 0;
+            if (squeeze && xf_reg[0x26] != 0) {
+                float lo = 1e9f, hi = -1e9f;
+                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; float x = vs[i].x / w; if (x < lo) lo = x; if (x > hi) hi = x; }
+                if (count && lo > 9.f) {   /* HUD text queued with a side tag (patches.c hud_text_x): untag, then anchor */
+                    int t = lo > 21.f ? 1 : -1; float off = t > 0 ? 25.6f : 12.8f;
+                    for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; vs[i].x -= off * w; }
+                    anchor = t;
+                } else if (g_hud_anchor >= 2) {   /* battle HUD: pieces on one side move to that edge; with 3 (spirit gauge), pieces across the middle stretch with the bar */
+                    if (hi < -0.05f) anchor = -1; else if (lo > 0.05f) anchor = 1; else if (g_hud_anchor == 3) spread = 1;
+                } else if (g_hud_anchor) {   /* only pieces entirely on that side of the screen move */
+                    anchor = g_hud_anchor;
+                    if (anchor * lo < 0.05f && anchor * hi < 0.05f) anchor = 0;
+                    for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; if (vs[i].x / w * g_hud_anchor < 0.05f) anchor = 0; }
+                }
             }
-            if (anchor) {   /* HUD element anchored to a screen edge (options: Widescreen HUD) */
-                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; vs[i].x = vs[i].x * 0.75f + anchor * 0.25f * w; }
+            if (anchor || spread) {   /* HUD element anchored to a screen edge (options: Widescreen HUD) */
+                if (anchor) for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; vs[i].x = vs[i].x * 0.75f + anchor * 0.25f * w; }
+                else {   /* the gauge bar runs from x 117 to 605 (of 640): map that span onto its moved ends */
+                    const float L = 117.f / 320.f - 1.f, R = 605.f / 320.f - 1.f, L2 = L * 0.75f - 0.25f, R2 = R * 0.75f + 0.25f, k = (R2 - L2) / (R - L);
+                    for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; vs[i].x = (L2 + (vs[i].x / w - L) * k) * w; }
+                }
                 g_clip43 = 0;
             } else {
                 if (squeeze) for (int i = 0; i < count; i++) vs[i].x *= 0.75f;
@@ -827,7 +842,7 @@ static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int
 /* ---------------- EFB copies ---------------- */
 int g_xfb_ready; u32 g_xfb_addr;
 static void efb_copy(u32 v) {
-    { extern int g_frame_no_pub; extern int g_dbgf; static int n; if ((g_dbgf && g_frame_no_pub == g_dbgf) || (!((v >> 14) & 1) && g_frame_no_pub > 1300 && g_frame_no_pub < 1320 && n++ < 60)) rt_log("texcopy %06X fmt %d src %06X wh %06X dst %08X stride %X pixfmt %X\n", v, ((v >> 4) & 7) | (((v >> 3) & 1) << 3), bp[0x49], bp[0x4A], (bp[0x4B] & 0xFFFFFF) << 5, bp[0x4D], bp[0x43]); }
+    { extern int g_frame_no_pub; extern int g_dbgf; static int n; static int cl = -1; if (cl < 0) cl = getenv("SOA_COPYLOG") != 0; if ((g_dbgf && g_frame_no_pub == g_dbgf) || (cl && n++ < 3000)) rt_log("f%d texcopy %06X fmt %d src %06X wh %06X dst %08X stride %X pixfmt %X\n", g_frame_no_pub, v, ((v >> 4) & 7) | (((v >> 3) & 1) << 3), bp[0x49], bp[0x4A], (bp[0x4B] & 0xFFFFFF) << 5, bp[0x4D], bp[0x43]); }
     u32 tl = bp[0x49], wh = bp[0x4A];
     int sx = tl & 0x3FF, sy = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
     u32 dst = (bp[0x4B] & 0xFFFFFF) << 5; u32 stride = (bp[0x4D] & 0x3FF) << 5;
@@ -1206,4 +1221,13 @@ void gx_state(SS* s) {
         g_rec = 0; g_pending_real = 0; g_prev_ok = 0; g_log[0].n = g_log[1].n = 0; st_save(&g_start[g_cur]);   /* no in-between frame across the load */
         if (g_use_gl) { extern void gl_texcache_clear(void); extern void gl_copies_clear(void); gl_texcache_clear(); gl_copies_clear(); }
     }
+}
+/* save-state import from a Dolphin dump (savestate.c): raw BP, XF (0x1058 words) and TMEM */
+void gx_import(const u32* bpv, const u32* xfv, int nxf, const u8* tm) {
+    memcpy(bp, bpv, sizeof bp);
+    for (int i = 0; i < nxf && i < 0x1100; i++) xf_store((u32)i, xfv[i]);
+    memcpy(tmem, tm, sizeof tmem);
+    bp[0xFE] = 0;   /* Dolphin keeps the BP mask at 0xFFFFFF; here non-zero means a masked write is pending */
+    for (int r = 0xE0; r <= 0xE7; r++) g_tevcol[(bp[r] >> 23) & 1][r - 0xE0] = bp[r];
+    g_tev.init = 0; g_tex_epoch++;
 }
