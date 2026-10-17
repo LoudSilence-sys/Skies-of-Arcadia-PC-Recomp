@@ -73,6 +73,9 @@ If you also own the **Dreamcast** version, music and sequenced sound effects can
 Dreamcast's own sound driver. It runs on an emulated Yamaha AICA (the Highly Theoretical core), using the
 sound banks from your Dreamcast discs. Music that exists only in Legends stays on the GameCube audio. Put
 the paths of your extracted Dreamcast disc folders in `dc_path.txt`, one per line.
+Only `BONITO.DRV`, `ARESNEW.MLT` and the `SOUND` folder are read from each disc. Disc 1 holds most of the
+banks. Disc 2 adds 105 more (later events, some fields and battles). Without disc 2, those pieces
+play with the GameCube audio instead.
 
 ## Building
 
