@@ -71,12 +71,13 @@ u64 host_tb(void) {
 }
 #endif
 
+s64 g_tb_off;   /* game time base = host time + this (quick load restores the saved game time) */
 /* ---------------- SPRs ---------------- */
 u32 MFSPR(Ctx* c, int spr) {
     switch (spr) {
     case 1: return c->xer; case 8: return c->lr; case 9: return c->ctr;
     case 22: { extern u32 sched_get_dec(void); return sched_get_dec(); } case 26: return c->srr0; case 27: return c->srr1;
-    case 268: return (u32)host_tb(); case 269: return (u32)(host_tb() >> 32);
+    case 268: return (u32)(host_tb() + g_tb_off); case 269: return (u32)((host_tb() + g_tb_off) >> 32);
     case 272: case 273: case 274: case 275: return c->sprg[spr - 272];
     case 287: return 0x00083214; /* PVR: Gekko */
     case 912: case 913: case 914: case 915: case 916: case 917: case 918: case 919: return c->gqr[spr - 912];
@@ -306,7 +307,6 @@ int main(int argc, char** argv) {
     rt_log("boot: entry %08X\n", entry);
     GuestFn f = lookup_fn(entry);
     if (!f) rt_fatal("no entry fn\n");
-    f(c);
-    rt_log("entry returned\n");
+    { extern void rs_run(Ctx* c, GuestFn entry, u32 entry_addr); rs_run(c, f, entry); }   /* savestate.c: also the target for loading a quick save */
     return 0;
 }

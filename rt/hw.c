@@ -509,3 +509,19 @@ void mmio_write(u32 a, u32 v, int size) {
 }
 
 void bad_access(u32 a, int size, int write) { rt_fatal("bad %s%d at %08X\n", write ? "W" : "R", size * 8, a); }
+
+/* ---------------- save states ---------------- */
+#include "pc.h"
+void hw_state(SS* s) {
+    SSV(s, g_r16);
+    if (!g_aram) g_aram = calloc(1, ARAM_SIZE);
+    ss_io(s, g_aram, ARAM_SIZE);
+    SSV(s, g_sram); SSV(s, g_exi);
+    SSV(s, g_di_pending); ss_time(s, &g_di_done_at);
+    SSV(s, g_si_pending); ss_time(s, &g_si_done_at);
+    SSV(s, g_ar_pending); ss_time(s, &g_ar_done_at);
+    SSV(s, g_mc_status); SSV(s, g_mc_cmd); SSV(s, g_mc_irqsw); SSV(s, g_mc_irq); SSV(s, g_mc_pos); SSV(s, g_mc_addr); SSV(s, g_mc_prog);
+    SSV(s, g_mc_done_pending); ss_time(s, &g_mc_done_at);
+    SSV(s, g_pe_pend_fin); SSV(s, g_pe_pend_tok); SSV(s, g_pe_tok);
+    SSV(s, g_dsp_out); SSV(s, g_dsp_out_n); SSV(s, g_dsp_boot_stage); SSV(s, g_dsp_in_hi);
+}

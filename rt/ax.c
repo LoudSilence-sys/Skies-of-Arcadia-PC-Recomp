@@ -298,7 +298,10 @@ int ai_dma_tick(int rate, u16* csr) {
         s16 r = (s16)(g_ram[a] << 8 | g_ram[a + 1]), l = (s16)(g_ram[a + 2] << 8 | g_ram[a + 3]);
         buf[2 * i] = l; buf[2 * i + 1] = r;
     }
+    extern int g_vol_master, g_vol_fx; extern void dcsnd_vol_init(void); dcsnd_vol_init();
+    if (g_vol_master >= 0 && g_vol_fx != 100) for (u32 i = 0; i < 2 * frames; i++) buf[i] = (s16)(buf[i] * g_vol_fx / 100);   /* GameCube mix: effects level */
     { extern void dcsnd_mix(s16*, u32, int); extern u64 g_pf_snd; u64 t = host_tb(); dcsnd_mix(buf, frames, rate); g_pf_snd += host_tb() - t; }
+    if (g_vol_master >= 0 && g_vol_master != 100) for (u32 i = 0; i < 2 * frames; i++) buf[i] = (s16)(buf[i] * g_vol_master / 100);
     host_audio_write(buf, frames, rate);
     g_dma_next += (u64)frames * 40500000ull / rate;
     if ((s64)(now - g_dma_next) > 40500000 / 10) g_dma_next = now;   /* don't spiral after stalls */
@@ -309,4 +312,10 @@ void ax_load_coeffs(const char* path) {
     FILE* f = fopen(path, "rb"); if (!f) return;
     u8 raw[0x1000]; if (fread(raw, 1, 0x1000, f) == 0x1000) { for (int i = 0; i < 0x800; i++) g_coeffs[i] = (s16)(raw[2 * i] << 8 | raw[2 * i + 1]); g_have_coeffs = 1; }
     fclose(f);
+}
+
+#include "pc.h"
+void ax_state(SS* s) {
+    SSV(s, s_main); SSV(s, s_auxa); SSV(s, s_auxb); SSV(s, g_cmd); SSV(s, g_state); SSV(s, g_cmdsize); SSV(s, g_booted);
+    SSV(s, g_dma_addr); SSV(s, g_dma_len); SSV(s, g_dma_on); ss_time(s, &g_dma_next);
 }

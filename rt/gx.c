@@ -502,6 +502,32 @@ int gx_tex_info(int map, u32* key, u32* w, u32* h, u32* mode0, u32* nbytes, u32*
     return 1;
 }
 float gx_viewport_wd(void) { return xff(0x101A); }
+/* the name Dolphin gives this texture when dumping / loading custom textures:
+   tex1_WxH[_m]_<xxh64 of the level-0 data>[_<xxh64 of the used palette range>]_<format> (see Dolphin TextureInfo) */
+#define XXH_INLINE_ALL
+#include "ext/xxhash.h"
+int gx_tex_dolphin_name(int map, char* out, int cap, char* wild_tlut, char* wild_tex) {
+    TexDesc d; get_tex(map, &d);
+    int b = map < 4 ? map : map - 4 + 0x20;
+    int mips = ((bp[0x80 + b] >> 5) & 3) != 0;
+    u32 n = tex_bytes(d.fmt, d.w, d.h);
+    const u8* data;
+    if (d.tm) { if (d.even + n > sizeof tmem) return 0; data = tmem + d.even; }
+    else { u32 a = d.addr & 0x01FFFFFF; if (a + n > RAM_SIZE) return 0; data = g_ram + a; }
+    unsigned long long th = XXH64(data, n, 0), lh = 0; int has_tlut = 0;
+    if (d.fmt == 8 || d.fmt == 9 || d.fmt == 10) {
+        u32 mn = 0xFFFF, mx = 0;
+        if (d.fmt == 8) for (u32 i = 0; i < n; i++) { u32 lo = data[i] & 15, hi = data[i] >> 4; if (lo < mn) mn = lo; if (hi < mn) mn = hi; if (lo > mx) mx = lo; if (hi > mx) mx = hi; }
+        else if (d.fmt == 9) for (u32 i = 0; i < n; i++) { if (data[i] < mn) mn = data[i]; if (data[i] > mx) mx = data[i]; }
+        else for (u32 i = 0; i < n; i += 2) { u32 v = (u32)(data[i] & 0x3F) << 8; /* as Dolphin: swap16() of a single byte */ if (v < mn) mn = v; if (v > mx) mx = v; }
+        if (mx >= mn) { u32 off = d.tlut_off + 2 * mn, sz = 2 * (mx + 1 - mn); if (off + sz <= sizeof tmem) { lh = XXH64(tmem + off, sz, 0); has_tlut = 1; } }
+    }
+    char base[48]; snprintf(base, sizeof base, "tex1_%ux%u%s", d.w, d.h, mips ? "_m" : "");
+    if (has_tlut) snprintf(out, cap, "%s_%016llx_%016llx_%u", base, th, lh, d.fmt); else snprintf(out, cap, "%s_%016llx_%u", base, th, d.fmt);
+    if (wild_tlut) snprintf(wild_tlut, 96, "%s_%016llx_$_%u", base, th, d.fmt);
+    if (wild_tex) { if (has_tlut) snprintf(wild_tex, 96, "%s_$_%016llx_%u", base, lh, d.fmt); else wild_tex[0] = 0; }
+    return 1;
+}
 /* number of mip levels usable for a texture map (1 = no mipmapping) */
 int gx_tex_levels(int map) {
     TexDesc d; get_tex(map, &d);
@@ -695,6 +721,7 @@ static void draw_core(int prim, int vat, int count, const InV* ins, const u8* da
 u64 g_pf_xform, g_pf_verts;   /* CPU vertex decode + transform time, vertices per frame (perf line) */
 int g_dbg_draw_no;             /* draw counter within the debug frame */
 static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int vsize);
+int g_hud_anchor;              /* widescreen HUD: -1 / +1 = the game is drawing a HUD element that belongs at the left / right edge */
 void gx_draw(int prim, int vat, int count, const u8* data, int vsize) {
     static InV ins[65536];
     u64 t0 = host_tb();
@@ -729,10 +756,20 @@ static void draw_out(int prim, int vat, int count, OutV* vs, const u8* data, int
                 for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; float x = vs[i].x / w; if (x < lo) lo = x; if (x > hi) hi = x; }
                 if (lo <= -0.98f && hi >= 0.98f) squeeze = 0;
             }
-            if (squeeze) for (int i = 0; i < count; i++) vs[i].x *= 0.75f;
-            /* 2D elements keep the 4:3 frame they were laid out for: anything beyond its edges (menus parked
-               off-screen, sliding panels) is clipped there instead of showing up in the wider picture */
-            g_clip43 = squeeze && xf_reg[0x26] != 0;
+            int anchor = 0;
+            if (squeeze && xf_reg[0x26] != 0 && g_hud_anchor) {   /* only pieces entirely on that side of the screen move */
+                anchor = g_hud_anchor;
+                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; if (vs[i].x / w * g_hud_anchor < 0.05f) anchor = 0; }
+            }
+            if (anchor) {   /* HUD element anchored to a screen edge (options: Widescreen HUD) */
+                for (int i = 0; i < count; i++) { float w = vs[i].w ? vs[i].w : 1; vs[i].x = vs[i].x * 0.75f + anchor * 0.25f * w; }
+                g_clip43 = 0;
+            } else {
+                if (squeeze) for (int i = 0; i < count; i++) vs[i].x *= 0.75f;
+                /* 2D elements keep the 4:3 frame they were laid out for: anything beyond its edges (menus parked
+                   off-screen, sliding panels) is clipped there instead of showing up in the wider picture */
+                g_clip43 = squeeze && xf_reg[0x26] != 0;
+            }
         } else g_clip43 = 0;
     }
     if (g_exp < 0) { const char* e = getenv("SOA_EXP"); g_exp = e ? atoi(e) : 0; }
@@ -915,7 +952,7 @@ int g_dump_every = 0;    /* SOA_DUMP=N: write every Nth frame to frames/ */
 int g_dump_every = 25;
 #endif
 static void dbg_init(void) { static int d; if (!d) { d = 1; const char* e = getenv("SOA_DBGFRAME"); if (e) g_dbgf = atoi(e); e = getenv("SOA_DUMP"); if (e) g_dump_every = atoi(e); } }
-WEAK void platform_present(void) { }
+WEAK void platform_present(void) { extern void gl_take_screenshot(void); if (g_use_gl) gl_take_screenshot(); }   /* headless: only screenshots */
 /* frame dumps: every g_dump_every-th frame, plus every frame in SOA_DUMPRANGE=a,b */
 int dump_this(int frame) {
     static int r0 = -1, r1; if (r0 < 0) { r0 = 0; r1 = -1; const char* e = getenv("SOA_DUMPRANGE"); if (e) sscanf(e, "%d,%d", &r0, &r1); }
@@ -950,7 +987,7 @@ static void rec_draw(int prim, int vat, int count, const OutV* vs, int pmi0) {
        p[2] = vertex format | first vertex's position matrix index << 8 (tells apart copies of one mesh) */
     u32 sig = 2166136261u; const u32 regs[] = {bp[0x94], bp[0x88], bp[0xC0], bp[0xC1], bp[0x28], bp[0x00], bp[0x41]};
     for (int i = 0; i < 7; i++) { sig ^= regs[i]; sig *= 16777619u; }
-    u32* p = ar_alloc(&g_log[g_cur], 16 + sizeof(OutV) * (size_t)count); p[0] = EV_DRAW | (sig & 0xFFFFFF00u); p[1] = (u32)prim; p[2] = (u32)vat | (u32)pmi0 << 8; p[3] = (u32)count; memcpy(p + 4, vs, sizeof(OutV) * (size_t)count);
+    u32* p = ar_alloc(&g_log[g_cur], 16 + sizeof(OutV) * (size_t)count); p[0] = EV_DRAW | (sig & 0xFFFFFF00u); p[1] = (u32)prim | (u32)(g_hud_anchor & 0xFF) << 16; p[2] = (u32)vat | (u32)pmi0 << 8; p[3] = (u32)count; memcpy(p + 4, vs, sizeof(OutV) * (size_t)count);
 }
 static void st_save(GxState* st) { memcpy(st->bp, bp, sizeof bp); memcpy(st->xf_mem, xf_mem, sizeof xf_mem); memcpy(st->xf_reg, xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(st->tevcol, g_tevcol, sizeof st->tevcol); }
 static void st_load(const GxState* st) { memcpy(bp, st->bp, sizeof bp); memcpy(xf_mem, st->xf_mem, sizeof xf_mem); memcpy(xf_reg, st->xf_reg, sizeof xf_reg); extern u32 g_tevcol[2][8]; memcpy(g_tevcol, st->tevcol, sizeof st->tevcol); }
@@ -1038,7 +1075,7 @@ static void replay(float t) {
                 }
             } else why = pe ? 3 : 4;
             if (ilog && g_frame_no_pub == ilog && why) rt_log("interp f%d: draw sig %08X prim %u n %d not blended: %s (worst jump %.3f)\n", ilog, e[0] & 0xFFFFFF00u, e[1], cnt, why == 1 ? "nan" : why == 2 ? "jump" : why == 3 ? "count differs" : "no match", worst);
-            draw_out((int)e[1], (int)(e[2] & 0xFF), cnt, tmp, 0, 0); o += 16 + sizeof(OutV) * e[3];
+            g_hud_anchor = (s8)(e[1] >> 16); draw_out((int)(e[1] & 0xFFFF), (int)(e[2] & 0xFF), cnt, tmp, 0, 0); g_hud_anchor = 0; o += 16 + sizeof(OutV) * e[3];
         }
     }
     g_replay = 0; g_rec = rec;
@@ -1066,6 +1103,7 @@ static void interp_frame_done(void) {
     {   /* the game already shows a new frame every field (some cutscenes and menus): nothing to fill in */
         static u64 last_vi; u64 vi = g_frames; int fields = (int)(vi - last_vi); last_vi = vi;
         if (fields <= 1) late = 1;
+        { extern int g_ff_mult; if (g_ff_mult > 1) late = 1; }   /* fast-forward: no in-between frames */
     }
     if (late) { g_pending_real = 0; gl_show_saved(1); platform_present(); gl_show_saved(0); }   /* the previous real frame never got its own field */
     if (g_prev_ok && !late) {
@@ -1081,11 +1119,21 @@ static void interp_frame_done(void) {
 }
 
 /* the options screen pauses the game: keep showing the last finished frame under it */
+/* also while the window is in the background, if "pause when unfocused" is on */
+int game_should_pause(void) {
+#ifdef _WIN32
+    extern int options_is_open(void); extern int platform_focused(void); extern int settings_get(const char*, int);
+    static int pu = -1; static u64 chk; u64 now = host_tb(); if (pu < 0 || now - chk > 40500000ull) { pu = settings_get("pause_unfocused", 1); chk = now; }
+    return options_is_open() || (pu && !platform_focused());
+#else
+    return 0;
+#endif
+}
 void options_pause_loop(void) {
 #ifdef _WIN32
-    extern int options_is_open(void); extern void options_input(u32); extern u32 si_pad_hi_raw(void);
+    extern void options_input(u32); extern u32 si_pad_hi_raw(void);
     extern void platform_pump(void); extern void gl_show_saved(int on);
-    while (options_is_open()) {
+    while (game_should_pause()) {
         platform_pump(); options_input(si_pad_hi_raw());
         gl_show_saved(1); platform_present(); gl_show_saved(0);
         usleep(16000);
@@ -1131,8 +1179,12 @@ presented:;
 #undef D
     }
     dbg_init(); g_frame_no++; g_frame_no_pub = g_frame_no;
+    {   /* SOA_SHOT=frame: take a screenshot (F12) at that frame */
+        static int sf = -2; if (sf == -2) { const char* e = getenv("SOA_SHOT"); sf = e ? atoi(e) : -1; }
+        if (sf >= 0 && g_frame_no >= sf) { sf = -1; extern void screenshot_request(void); screenshot_request(); }
+    }
     {   /* SOA_RAMDUMP=f1,f2,...: write main RAM to frames/ram_F.bin at those XFB frames */
-        static int fr[8], nfr = -1; if (nfr < 0) { nfr = 0; const char* e = getenv("SOA_RAMDUMP"); if (e) nfr = sscanf(e, "%d,%d,%d,%d,%d,%d,%d,%d", &fr[0], &fr[1], &fr[2], &fr[3], &fr[4], &fr[5], &fr[6], &fr[7]); }
+        static int fr[64], nfr = -1; if (nfr < 0) { nfr = 0; const char* e = getenv("SOA_RAMDUMP"); while (e && *e && nfr < 64) { int a, b = -1, st = 1, k = 0; if (sscanf(e, "%d-%d:%d%n", &a, &b, &st, &k) == 3 || (b = -1, sscanf(e, "%d%n", &a, &k) == 1)) { if (b < 0) b = a; for (int x = a; x <= b && nfr < 64; x += st) fr[nfr++] = x; } e += k ? k : 1; if (*e == ',') e++; } }
         for (int i = 0; i < nfr; i++) if (fr[i] == g_frame_no) { char p[64]; snprintf(p, sizeof p, "frames/ram_%d.bin", g_frame_no); FILE* f = fopen(p, "wb"); if (f) { fwrite(g_ram, 1, RAM_SIZE, f); fclose(f); } }
     }
     { static int armed = 1; if (armed && getenv("SOA_REDDBG")) { double m[3] = {0, 0, 0}; for (int y = 0; y < 480; y += 8) for (int x = 0; x < 640; x += 8) { u32 c = efb_c[y * EFB_W + x]; m[0] += c & 255; m[1] += (c >> 8) & 255; m[2] += (c >> 16) & 255; }
@@ -1142,5 +1194,16 @@ presented:;
     if (dump_this(g_frame_no)) {
         char p[64]; snprintf(p, sizeof p, "frames/f%05d.ppm", g_frame_no);
         gx_dump_efb(p, w, h);
+    }
+}
+
+/* ---------------- save states ---------------- */
+#include "pc.h"
+void gx_state(SS* s) {
+    SSV(s, bp); SSV(s, xf_mem); SSV(s, xf_reg); SSV(s, tmem); SSV(s, g_tevcol); SSV(s, g_xfb_addr); SSV(s, g_xfb_ready);
+    if (s->load) {
+        g_tev.init = 0; g_tex_epoch++;
+        g_rec = 0; g_pending_real = 0; g_prev_ok = 0; g_log[0].n = g_log[1].n = 0; st_save(&g_start[g_cur]);   /* no in-between frame across the load */
+        if (g_use_gl) { extern void gl_texcache_clear(void); extern void gl_copies_clear(void); gl_texcache_clear(); gl_copies_clear(); }
     }
 }

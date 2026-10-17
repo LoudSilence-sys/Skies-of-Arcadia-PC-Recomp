@@ -33,6 +33,11 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
 #define GL_BLEND 0x0BE2
 #define GL_SCISSOR_TEST 0x0C11
 #define GL_DEPTH_CLAMP 0x864F
+#define GL_TEXTURE_MAX_ANISOTROPY 0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
+#define GL_MAX_SAMPLES 0x8D57
+#define GL_TEXTURE_2D_MULTISAMPLE 0x9100
+#define GL_MULTISAMPLE 0x809D
 #define GL_CLIP_DISTANCE0 0x3000
 #define GL_CLIP_DISTANCE1 0x3001
 #define GL_CLIP_DISTANCE2 0x3002
@@ -93,7 +98,9 @@ typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef void GLvoid; t
   X(void, glClearDepth, (double)) X(void, glClear, (GLbitfield)) X(void, glDepthFunc, (GLenum)) X(void, glDepthMask, (GLboolean)) \
   X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean)) X(void, glBlendFunc, (GLenum, GLenum)) \
   X(void, glBlendEquation, (GLenum)) X(void, glBlendFuncSeparate, (GLenum, GLenum, GLenum, GLenum)) X(void, glBlendEquationSeparate, (GLenum, GLenum)) X(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*)) \
-  X(void, glPixelStorei, (GLenum, GLint)) X(void, glGenTextures, (GLsizei, GLuint*)) X(void, glDeleteTextures, (GLsizei, const GLuint*)) \
+  X(void, glPixelStorei, (GLenum, GLint)) X(void, glGenTextures, (GLsizei, GLuint*)) X(void, glDeleteTextures, (GLsizei, const GLuint*)) X(void, glGenerateMipmap, (GLenum)) \
+  X(void, glCompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void*)) X(void, glRenderbufferStorageMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei)) \
+  X(void, glGetIntegerv, (GLenum, GLint*)) X(void, glGetFloatv, (GLenum, GLfloat*)) \
   X(void, glBindTexture, (GLenum, GLuint)) X(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
   X(void, glTexParameteri, (GLenum, GLenum, GLint)) X(void, glTexParameterf, (GLenum, GLenum, GLfloat)) X(void, glActiveTexture, (GLenum)) X(void, glDrawArrays, (GLenum, GLint, GLsizei)) \
   X(void, glGenBuffers, (GLsizei, GLuint*)) X(void, glBindBuffer, (GLenum, GLuint)) X(void, glBufferData, (GLenum, GLsizeiptr, const void*, GLenum)) X(void, glBufferSubData, (GLenum, GLintptr, GLsizeiptr, const void*)) \

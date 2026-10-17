@@ -94,6 +94,7 @@ WEAK void platform_pump(void) {
 }
 static int g_idle_now;          /* rt_poll called from the idle loop: the game is waiting */
 int g_vi_wait;                  /* a thread is inside VIWaitForRetrace */
+int g_ff_mult = 1;               /* fast-forward multiplier (platform layer sets it while the key is held) */
 int g_vi_defer_max = 0;         /* retrace held back while the game is busy, up to this many fields (SOA_VIDEFER) */
 void rt_poll(Ctx* c) {
     g_poll_ctr = 2000;
@@ -112,15 +113,16 @@ void rt_poll(Ctx* c) {
     { static int logged; if (logged < 3 && (s64)(now - g_next_vi) >= (s64)(g_vi_period * 10) && !g_idle_now && !g_vi_wait && (s64)(now - g_vi_poll_tb) >= (s64)(TB_RATE / 500)) { logged++; extern void rt_backtrace(Ctx*); rt_log("VI held %d periods; game busy in thread %08X msr %08X:\n", (int)((now - g_next_vi) / g_vi_period), R32(0x800000E4), c->msr); rt_backtrace(c); } }
     int waiting = g_idle_now || g_vi_wait || (s64)(now - g_vi_poll_tb) < (s64)(TB_RATE / 500);   /* idle, in VIWaitForRetrace, or polling the retrace count */
     if ((s64)(now - g_next_vi) >= 0 && (waiting || (s64)(now - g_next_vi) >= (s64)(g_vi_period * (u64)g_vi_defer_max))) {
-        if ((s64)(now - g_next_vi) >= (s64)g_vi_period) g_next_vi = now + g_vi_period; /* late: resync rather than catch up */
-        else g_next_vi += g_vi_period;
+        u64 per = g_vi_period / (u64)(g_ff_mult > 1 ? g_ff_mult : 1);   /* fast-forward: fields come faster */
+        if ((s64)(now - g_next_vi) >= (s64)per) g_next_vi = now + per; /* late: resync rather than catch up */
+        else g_next_vi += per;
         g_frames++;
         { extern int g_dbgf, g_frame_no_pub, g_dbg_draw_no; if (g_dbgf && g_frame_no_pub == g_dbgf) rt_log("VI delivered after draw %d (waiting=%d idle=%d viwait=%d)\n", g_dbg_draw_no, waiting, g_idle_now, g_vi_wait); }
         { extern void platform_pump(void); platform_pump(); }
-        vi_retrace_event();
+        vi_retrace_event(); { extern void quickstate_tick(void); quickstate_tick(); }
         { extern void interp_vi(void); interp_vi(); }
         { extern void options_input(u32); extern u32 si_pad_hi_raw(void); options_input(si_pad_hi_raw()); }
-        { extern int options_is_open(void); extern void options_pause_loop(void); if (options_is_open()) { options_pause_loop(); g_next_vi = host_tb() + g_vi_period; } }
+        { extern int game_should_pause(void); extern void options_pause_loop(void); if (game_should_pause()) { options_pause_loop(); g_next_vi = host_tb() + g_vi_period; } }
         { extern int vi_refresh_hz(void); static int hz = 50; int nh = vi_refresh_hz(); if (nh != hz) { hz = nh; g_vi_period = TB_RATE / hz; rt_log("VI: %d Hz\n", hz); } }
     }
     hw_tick();
@@ -155,4 +157,10 @@ void rt_idle(Ctx* c) {
     }
     rt_poll(c);
     g_idle_now = 0;
+}
+
+#include "pc.h"
+void sched_state(SS* s) {
+    ss_time(s, &g_next_vi); SSV(s, g_dec_armed); ss_time(s, &g_dec_deadline); SSV(s, g_vi_period);
+    if (s->load) { g_poll_ctr = 0; g_in_irq = 0; }
 }

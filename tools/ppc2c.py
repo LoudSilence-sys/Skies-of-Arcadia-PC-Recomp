@@ -47,6 +47,7 @@ class Gen:
         self.entry = start; start = fstart
         self.R = R; self.start = start; self.end = end; self.fstart = fstart; self.fend = fend
         self.out = []; self.labels = set(); self.need_dispatch = False
+        self.rs = set()   # unconditional call sites: resume points for save-state loading (rs_take)
 
     def emit(self, s): self.out.append(s)
 
@@ -109,6 +110,11 @@ class Gen:
             body.append((pc, self.out))
             pc += 4
         lines = []
+        if self.rs:   # resuming a saved call stack: jump straight back into the call that was in progress
+            lines.append('  if (g_rs_n) switch (rs_take(c)) {')
+            for pc in sorted(self.rs): lines.append('  case 0x%08X: goto RS_%08X;' % (pc + 4, pc))
+            lines.append('  default: return;')
+            lines.append('  }')
         if self.entry != self.start:
             self.labels.add(self.entry); lines.append('  goto %s;' % self.target_label(self.entry))
         if self.need_dispatch:
@@ -116,6 +122,7 @@ class Gen:
                 if self.start <= t < self.end: self.labels.add(t)
         for pc, out in body:
             if pc in self.labels: lines.append('%s:;' % self.target_label(pc))
+            if pc in self.rs: lines.append('RS_%08X:;' % pc)
             if pc in R.idle_pcs: lines.append('  rt_idle(c);')
             lines.extend(out)
         nxt = self.end
@@ -141,6 +148,7 @@ class Gen:
         if op == 18:
             li = sext(w & 0x03FFFFFC, 26); aa = (w >> 1) & 1; lk = w & 1
             t = (li if aa else pc + li) & 0xFFFFFFFF
+            if lk: self.rs.add(pc)
             e('  ' + self.branch_to(t, lk, pc)); return
         if op == 16:
             bo = rD; bi = rA; bd = sext(w & 0xFFFC, 16); aa = (w >> 1) & 1; lk = w & 1
@@ -161,6 +169,7 @@ class Gen:
                 bo = rD; bi = rA; lk = w & 1
                 cond = self.cond_expr(bo, bi, use_ctr=False)
                 if lk:
+                    if (bo & 0x14) == 0x14: self.rs.add(pc)
                     e('  if (%s) { c->lr = 0x%08X; call_indirect(c, c->ctr); }' % (cond, pc + 4))
                 else:
                     self.need_dispatch = True
@@ -516,7 +525,7 @@ class Recomp:
         self.scan()
         ents = sorted(self.entries.items())
         with open(os.path.join(outdir, 'funcs.h'), 'w') as h:
-            h.write('#pragma once\n#include "rt.h"\n')
+            h.write('#pragma once\n#include "rt.h"\nextern int g_rs_n; u32 rs_take(Ctx* c);\n')
             for a, _ in ents: h.write('void f_%08X(Ctx* c);\nvoid r_%08X(Ctx* c);\n' % (a, a))
         names = {a: n for a, s, n in self.funcs}
         nfile = 0
@@ -533,6 +542,9 @@ class Recomp:
             t.write('#include "funcs.h"\nconst FuncEntry g_func_table[] = {\n')
             for a, _ in ents: t.write('  {0x%08X, f_%08X},\n' % (a, a))
             t.write('};\nconst int g_func_count = %d;\n' % len(ents))
+            t.write('const unsigned g_fn_bounds[] = {\n')   # function [start, end) pairs, sorted (save-state call-stack checks)
+            for fa, fsz, fn in self.funcs: t.write('  0x%08X, 0x%08X,\n' % (fa, fa + fsz))
+            t.write('};\nconst int g_fn_nbounds = %d;\n' % len(self.funcs))
         with open(os.path.join(outdir, 'names.txt'), 'w') as nf:
             for a, s, n in self.funcs: nf.write('%08X %s\n' % (a, n))
         print('entries', len(ents), 'files', nfile, 'unimplemented', dict(self.unimpl))

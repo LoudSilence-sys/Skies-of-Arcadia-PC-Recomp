@@ -150,7 +150,13 @@ static int g_log;
    balance against effects (it is mixed hotter there); effects are offset down and the whole Dreamcast
    mix gets +7.1 dB, so both land at the measured GameCube levels. */
 #define MUSIC_BIAS_DB 9.5   /* measured: menu SE matched GC at -2.9 dB, battleship music needed +5 dB */
+int g_vol_master = -1, g_vol_music = 100, g_vol_fx = 100;   /* options: 0..100 */
+void dcsnd_vol_init(void);
+static void vol_init(void) { if (g_vol_master < 0) { extern int settings_get(const char*, int); g_vol_master = settings_get("volume_master", 100); g_vol_music = settings_get("volume_music", 100); g_vol_fx = settings_get("volume_effects", 100); } }
+void dcsnd_vol_init(void) { vol_init(); }
 static int dc_vol(int v, int music) {
+    vol_init();
+    v = v * (music ? g_vol_music : g_vol_fx) / 100;
     if (v <= 0) return 0;
     double db = 20.0 * log10(v / 127.0) - (music ? 0.0 : MUSIC_BIAS_DB);
     int d = (int)lround(127.0 + db / 0.41);
@@ -380,10 +386,31 @@ void r_80270358(Ctx*); void r_80270610(Ctx*); void r_80270538(Ctx*);
 
 static void dc_8027E6F8(Ctx* c);
 void f_8027E6F8(Ctx* c) { LOCK(); dc_8027E6F8(c); UNLOCK(); }
+/* GameCube-path music sequences: their volume is scaled by music/effects (the whole GameCube mix already gets
+   the effects level in ax.c), so the music slider applies to them as well */
+static u32 g_gcmusic[16]; static int g_gcmusic_n;
+static int gc_is_music(u32 id) { for (int i = 0; i < 16; i++) if (g_gcmusic[i] == id && id) return 1; return 0; }
+static int gc_music_scale(int v) { vol_init(); int fx = g_vol_fx ? g_vol_fx : 1; long r = (long)v * g_vol_music / fx; return r > 127 ? 127 : (int)r; }
 static void dc_8027E6F8(Ctx* c) {   /* sndSeqPlayEx(groupId, songId, arrfile, params, studio) */
-    u32 id = dc_play(c->r[3] & 0xFFFF, c->r[4] & 0xFFFF);
+    u32 group = c->r[3] & 0xFFFF;
+    u32 id = dc_play(group, c->r[4] & 0xFFFF);
     if (id != 0xFFFFFFFFu) { c->r[3] = id; return; }
     r_8027E6F8(c);
+    int s = find_slot(group);
+    if (s >= 0 && c->r[3] != 0xFFFFFFFFu) {
+        char name[16]; slot_name(s, name);
+        if (name[0] == 'M' && name[1] == '0') {
+            g_gcmusic[g_gcmusic_n++ & 15] = c->r[3];
+            vol_init();
+            if (g_vol_music != g_vol_fx) { Ctx save = *c; c->r[3] = (u32)gc_music_scale(127); c->r[4] = 0; c->r[5] = save.r[3]; c->r[6] = 0; r_802704D0(c); *c = save; }
+        }
+    }
+}
+/* options: re-send every playing sequence's volume after a slider change */
+void dcsnd_volumes_changed(void) {
+    LOCK();
+    for (int i = 0; i < NINST; i++) { Inst* in = &g_inst[i]; for (int p = 0; p < NPORT; p++) { Port* pt = &in->port[p]; if (pt->id && (pt->busy || pt->pending)) cmd(in, 0x05, 0, p, dc_vol(pt->vol, pt->music), 0, 0); } }
+    UNLOCK();
 }
 static void dc_802703C0(Ctx* c);
 void f_802703C0(Ctx* c) { LOCK(); dc_802703C0(c); UNLOCK(); }
@@ -398,7 +425,7 @@ static void dc_802704D0(Ctx* c);
 void f_802704D0(Ctx* c) { LOCK(); dc_802704D0(c); UNLOCK(); }
 static void dc_802704D0(Ctx* c) {   /* sndSeqVolume(vol, time ms, seqId, mode) */
     u32 id = c->r[5];
-    if (!is_dc_id(id)) { r_802704D0(c); return; }
+    if (!is_dc_id(id)) { if (gc_is_music(id)) { u32 v = c->r[3]; c->r[3] = (u32)gc_music_scale((int)(v & 0xFF) > 127 ? 127 : (int)(v & 0xFF)); r_802704D0(c); return; } r_802704D0(c); return; }
     Port* pt; Inst* in = id_inst(id, &pt); if (!pt) return;
     int vol = c->r[3] & 0xFF; if (vol > 127) vol = 127; int ms = c->r[4] & 0xFFFF; int mode = c->r[6] & 0xFF;
     if (ms < 5) {
@@ -470,4 +497,27 @@ static void dc_802706A4(Ctx* c) {   /* sndOutputMode(0 = mono, 1 = stereo, 2 = s
     if (!g_on) return;
     for (int i = 0; i < NINST; i++) yam_aica_store_reg(dcsound_get_yam_state(g_inst[i].dc), 0x2800, mono ? 0x8000 : 0, 0x8000, 0);
     if (g_log) rt_log("dcsnd: output mode %s\n", mono ? "mono" : "stereo");
+}
+
+/* ---------------- save states ---------------- */
+#include "pc.h"
+void dcsnd_state(SS* s) {
+    int on = g_on; SSV(s, on);
+    if (s->load && on && !g_tried && g_dc_user != 0) g_on = dcsnd_init();
+    SSV(s, g_gcmusic); SSV(s, g_gcmusic_n);
+    if (!on) { if (s->load && g_on) { LOCK(); for (int i = 0; i < NINST; i++) for (int p = 0; p < NPORT; p++) if (g_inst[i].port[p].id) cmd(&g_inst[i], 0x02, 0, p, 1, 0, 0); UNLOCK(); } return; }
+    u32 sz = g_on ? sega_get_state_size(2) : 0; SSV(s, sz);
+    u8* scratch = 0;
+    LOCK();
+    SSV(s, g_gen);
+    for (int i = 0; i < NINST; i++) {
+        Inst* in = &g_inst[i];
+        SSV(s, in->used); ss_time(s, &in->last_active); SSV(s, in->bank_mlt); SSV(s, in->nq); SSV(s, in->q);
+        for (int p = 0; p < NPORT; p++) { SSV(s, in->port[p]); ss_time(s, &in->port[p].started); }
+        if (g_on && in->st) ss_io(s, in->st, sz);
+        else { if (!scratch) scratch = malloc(sz ? sz : 1); ss_io(s, scratch, sz); }
+    }
+    if (s->load) g_rr = g_rw;   /* drop queued output from before the load */
+    UNLOCK();
+    free(scratch);
 }

@@ -32,3 +32,6 @@ void FN_DVDGetDriveStatus(Ctx* c) {
     static s32 last = 12345; RN_DVDGetDriveStatus(c);
     if ((s32)c->r[3] != last) { last = (s32)c->r[3]; rt_log("DVDGetDriveStatus -> %d\n", last); }
 }
+
+#include "pc.h"
+void hle_state(SS* s) { SSV(s, g_main_ctx); }

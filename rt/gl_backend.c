@@ -3,6 +3,8 @@
    as a single "uber" fragment shader driven by the raw BP register words. */
 #include "rt.h"
 #include "glmini.h"
+#include "pc.h"
+int settings_get(const char* key, int def);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -146,6 +148,11 @@ static const char* FS =
 "}\n";
 
 static GLuint g_prog, g_vao, g_vbo, g_fbo, g_fbtex, g_fbdepth;
+/* MSAA (options): the game renders into a multisampled copy of the EFB, resolved into g_fbo/g_fbtex before
+   anything reads it (EFB copies, readbacks, presentation) */
+static int g_msaa = 1, g_ms_dirty; static GLuint g_msfbo, g_msc, g_msd;
+#define DRAWFBO (g_msaa > 1 ? g_msfbo : g_fbo)
+static void efb_resolve(void);
 static GLint u_texdim, u_scale, u_cenv, u_aenv, u_order, u_ksel, u_misc, u_reg, u_konst, u_tex[8], u_fog, u_fogcol, u_fogmode, u_ind, u_imtx, u_fogk, u_fogrc;
 int g_gl_ok;
 
@@ -216,7 +223,7 @@ int gl_init(void) {
        vertex shader writes them, the copy and overlay ones with "inside" */
     glEnable(GL_CLIP_DISTANCE0); glEnable(GL_CLIP_DISTANCE1); glEnable(GL_CLIP_DISTANCE2); glEnable(GL_CLIP_DISTANCE3);
     /* EFB */
-    glGenFramebuffers(1, &g_fbo); glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glGenFramebuffers(1, &g_fbo); glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     glGenTextures(1, &g_fbtex); glBindTexture(GL_TEXTURE_2D, g_fbtex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -233,17 +240,18 @@ int gl_init(void) {
     glGenRenderbuffers(1, &g_rdepth); glBindRenderbuffer(GL_RENDERBUFFER, g_rdepth);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, EFB_W, EFB_H);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_rdepth);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     glViewport(0, 0, SW, SH);
     glClearColor(0, 0, 0, 0); glClearDepth(1.0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ALIGNMENT, 1);
     g_gl_ok = 1;
+    { int ms = settings_get("msaa", 1); if (getenv("SOA_MSAA")) ms = atoi(getenv("SOA_MSAA")); if (ms > 1) gl_set_msaa(ms); }
     return 1;
 }
 
 /* ---------------- texture cache ---------------- */
 typedef struct { u32 key[4]; u32 hash; GLuint tex; u32 w, h; u64 frame; int levels; } TexEnt;
-#define TCACHE 1024
+#define TCACHE 4096
 static TexEnt g_tc[TCACHE];
 u64 g_gl_frame;
 static u32 fnv(const u8* p, u32 n) { u32 h = 2166136261u; for (u32 i = 0; i < n; i += 4) { h ^= p[i] | p[i + 1] << 8 | p[i + 2] << 16 | (u32)p[i + 3] << 24; h *= 16777619u; } return h; }
@@ -290,10 +298,11 @@ static u32 sampled_hash(u32 a, u32 n) { u32 h = 2166136261u; for (u32 i = 0; i +
 static GLuint compile(GLenum t, const char* src);
 /* copy fmt (GX EFB copy format) -> texture format the game will sample it as */
 static int copy_tex_fmt(int f) { static const int m[13] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3}; return f >= 0 && f < 13 ? m[f] : -1; }
+void gl_copies_clear(void) { for (int i = 0; i < NCOPY; i++) g_copies[i].used = 0; }
 void gl_copies_frame_start(void) { for (int i = 0; i < NCOPY; i++) { g_copies[i].start = g_copies[i].cur; g_copies[i].shadow = -1; } }
 int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, int noalpha, u32 dst, u32 nbytes, int gamma) {
     if (!g_gpu_copies || copy_tex_fmt(fmt) < 0) return 0;
-    gl_flush(); gl_state_dirty();
+    gl_flush(); gl_state_dirty(); efb_resolve();
     if (!g_cprog) {
         GLuint vs = compile(GL_VERTEX_SHADER, CVS), fs = compile(GL_FRAGMENT_SHADER, CFS);
         g_cprog = glCreateProgram(); glAttachShader(g_cprog, vs); glAttachShader(g_cprog, fs); glLinkProgram(g_cprog);
@@ -342,7 +351,7 @@ int gl_efb_copy_tex(int sx, int sy, int w, int h, int half, int fmt, int inten, 
     glUniform1ui(uc_fmt, (GLuint)fmt); glUniform1ui(uc_flags, (inten ? 1u : 0u) | (noalpha ? 2u : 0u));
     glUniform1f(uc_gamma, gamma == 1 ? 1.7f : gamma == 2 ? 2.2f : 1.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); glViewport(0, 0, SW, SH);
     glUseProgram(g_prog); glBindVertexArray(g_vao);
     return 1;
 }
@@ -365,6 +374,67 @@ static GLuint copy_lookup(u32 addr, u32 w, u32 h, u32 fmt) {
 u64 host_tb(void);
 u64 g_pf_idle, g_pf_snd, g_pf_hash, g_pf_flush, g_pf_read, g_pf_present, g_pf_draws, g_pf_upload, g_pf_ccopy, g_pf_zcopy, g_pf_ztime, g_pf_upn, g_pf_upbytes;   /* perf counters (timebase ticks) */
 static float g_texdim[8][2];
+/* ---------------- custom textures (Dolphin-format packs, pcfeat.c) ---------------- */
+int texpack_enabled(void); const char* texpack_lookup(const char* full, const char* wild_tlut, const char* wild_tex);
+u8* texpack_load_png(const char* path, int* w, int* h); void texpack_free(void* p); void texpack_mip_path(const char* base, int level, char* out, int cap);
+int gx_tex_dolphin_name(int map, char* out, int cap, char* wild_tlut, char* wild_tex);
+static int g_aniso_max = -1;
+int g_aniso = -1;   /* anisotropic filtering level (options; 0/1 = off) */
+/* DDS (BC1/BC2/BC3/BC7 or RGBA8), straight to the GPU; returns the number of levels uploaded, 0 if unsupported */
+static int upload_dds(const char* path) {
+    FILE* f = fopen(path, "rb"); if (!f) return 0;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    u8* b = malloc(n); if (!b || fread(b, 1, n, f) != (size_t)n || n < 128 || memcmp(b, "DDS ", 4)) { fclose(f); free(b); return 0; }
+    fclose(f);
+    u32 h = *(u32*)(b + 12), w = *(u32*)(b + 16), mips = *(u32*)(b + 28), pff = *(u32*)(b + 80), cc = *(u32*)(b + 84); long off = 128;
+    if (!mips) mips = 1;
+    GLenum fmt = 0; u32 bsz = 16;
+    if (pff & 4) {
+        if (cc == 0x31545844) { fmt = 0x83F1; bsz = 8; } else if (cc == 0x33545844) fmt = 0x83F2; else if (cc == 0x35545844) fmt = 0x83F3;
+        else if (cc == 0x30315844 && n >= 148) { u32 dx = *(u32*)(b + 128); off = 148; if (dx == 98 || dx == 99) fmt = 0x8E8C; else if (dx == 71 || dx == 72) { fmt = 0x83F1; bsz = 8; } else if (dx == 77 || dx == 78) fmt = 0x83F3; else if (dx == 74 || dx == 75) fmt = 0x83F2; else if (dx == 28 || dx == 29) fmt = 1; }
+    } else if (*(u32*)(b + 88) == 32) fmt = 2;   /* uncompressed 32-bit */
+    if (!fmt) { free(b); return 0; }
+    u32 lw = w, lh = h; int lv = 0;
+    for (u32 m = 0; m < mips; m++) {
+        if (fmt == 1 || fmt == 2) {
+            u32 sz = lw * lh * 4; if (off + sz > n) break;
+            if (fmt == 2) { u8* p = b + off; for (u32 i = 0; i < lw * lh; i++) { u8 t = p[4 * i]; p[4 * i] = p[4 * i + 2]; p[4 * i + 2] = t; } }   /* BGRA -> RGBA */
+            glTexImage2D(GL_TEXTURE_2D, (GLint)m, GL_RGBA8, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, b + off); off += sz;
+        } else {
+            u32 sz = ((lw + 3) / 4) * ((lh + 3) / 4) * bsz; if (off + sz > n) break;
+            glCompressedTexImage2D(GL_TEXTURE_2D, (GLint)m, fmt, lw, lh, 0, (GLsizei)sz, b + off); off += sz;
+        }
+        lv++; lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
+    }
+    free(b);
+    if (!lv) return 0;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, lv - 1);
+    return lv;
+}
+static int upload_custom(int map, int levels) {
+    char full[128], wt[96], wx[96];
+    if (!gx_tex_dolphin_name(map, full, sizeof full, wt, wx)) return 0;
+    const char* path = texpack_lookup(full, wt, wx); if (!path) return 0;
+    { static int n; if (n++ < 40) rt_log("texture pack: %s -> %s\n", full, path); }
+    size_t pl = strlen(path);
+    if (pl > 4 && (!strcmp(path + pl - 4, ".dds") || !strcmp(path + pl - 4, ".DDS"))) {
+        int lv = upload_dds(path); if (!lv) return 0;
+        if (lv == 1 && levels > 1) { glGenerateMipmap(GL_TEXTURE_2D); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1000); return 11; }
+        return lv;
+    }
+    int w, h; u8* px = texpack_load_png(path, &w, &h); if (!px) return 0;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    texpack_free(px);
+    int lv = 1;
+    if (levels > 1) {   /* the pack's own mip levels when present, else generated */
+        for (int l = 1; l < 14; l++) { char mp[1100]; texpack_mip_path(path, l, mp, sizeof mp); int mw, mh; u8* m = texpack_load_png(mp, &mw, &mh); if (!m) break; glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, mw, mh, 0, GL_RGBA, GL_UNSIGNED_BYTE, m); texpack_free(m); lv++; }
+        if (lv == 1) { glGenerateMipmap(GL_TEXTURE_2D); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1000); return 11; }
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, lv - 1);
+    return lv;
+}
+/* drop all cached textures (texture pack toggled): they are re-uploaded on next use */
+void gl_texcache_clear(void) { for (int i = 0; i < TCACHE; i++) if (g_tc[i].tex) { glDeleteTextures(1, &g_tc[i].tex); memset(&g_tc[i], 0, sizeof g_tc[i]); } }
 static void bind_tex(int map) {
     u32 key[4], w, h, mode0, nbytes, addr;
     gx_tex_info(map, key, &w, &h, &mode0, &nbytes, &addr);
@@ -387,11 +457,13 @@ static void bind_tex(int map) {
         hash ^= key[3];
     }
     g_pf_hash += host_tb() - th;
-    u32 slot = (key[0] * 2654435761u ^ key[1] * 40503u ^ key[2]) % TCACHE;
+    /* cached by content (hash, size, format, palette), not by address: the game renders text glyphs into a
+       small ring of buffers every frame, so the same glyph turns up at changing addresses */
+    u32 slot = (hash * 2654435761u ^ key[1] * 40503u ^ key[2]) % TCACHE;
     TexEnt* e = 0;
     for (int probe = 0; probe < 8; probe++) {
         TexEnt* t = &g_tc[(slot + probe) % TCACHE];
-        if (t->tex && !memcmp(t->key, key, 12) && t->hash == hash && t->levels >= levels) { e = t; break; }
+        if (t->tex && t->key[1] == key[1] && t->key[2] == key[2] && t->hash == hash && t->levels >= levels) { e = t; break; }
     }
     if (!e) {
         TexEnt* t = &g_tc[slot]; u64 oldest = ~0ull;
@@ -399,15 +471,18 @@ static void bind_tex(int map) {
         u64 tu = host_tb();
         static u32* buf; static u32 bufn;
         if (w * h > bufn) { bufn = w * h; buf = realloc(buf, bufn * 4); }
-        gx_tex_decode(map, buf);
         if (!t->tex) glGenTextures(1, &t->tex);
         glActiveTexture(GL_TEXTURE0 + map); glBindTexture(GL_TEXTURE_2D, t->tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-        for (int l = 1; l < levels; l++) {
-            u32 lw, lh; gx_tex_decode_level(map, l, buf, &lw, &lh);
-            glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-        }
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+        int hd = texpack_enabled() ? upload_custom(map, levels) : 0;
+        if (!hd) {
+            gx_tex_decode(map, buf);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+            for (int l = 1; l < levels; l++) {
+                u32 lw, lh; gx_tex_decode_level(map, l, buf, &lw, &lh);
+                glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, lw, lh, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+            }
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, levels - 1);
+        } else if (hd > 1) levels = hd;
         memcpy(t->key, key, 12); t->hash = hash; t->w = w; t->h = h; t->levels = levels; e = t;
         g_pf_upload += host_tb() - tu; g_pf_upn++; g_pf_upbytes += (u64)w * h * 4;
         { static int lg = -1; if (lg < 0) lg = getenv("SOA_TEXLOG") ? atoi(getenv("SOA_TEXLOG")) : 0; if (lg > 0) { lg--; extern int g_frame_no_pub; rt_log("texup f%d map %d addr %08X %ux%u fmt %u levels %d (%u B) tlut %08X\n", g_frame_no_pub, map, addr, w, h, key[2] & 15, levels, nbytes, key[1]); } }
@@ -418,7 +493,8 @@ params:;
     {   /* sampler state lives in the texture object: only re-send it when it differs from what the object has */
         GLuint cur = bound;
         int b = map < 4 ? map : map - 4 + 0x20; u32 m1 = levels > 1 ? gx_bp_regs()[0x84 + b] : 0;
-        u32 want0 = (mode0 & 0xFFFF) | (levels > 1 ? 1u << 16 : 0), want1 = m1 & 0xFFFF;
+        extern int g_aniso; if (g_aniso < 0) g_aniso = settings_get("anisotropy", 4);
+        u32 want0 = (mode0 & 0xFFFF) | (levels > 1 ? 1u << 16 : 0) | (u32)g_aniso << 20, want1 = m1 & 0xFFFF;
         typedef struct { GLuint tex; u32 m0, m1; } SP; static SP sp[4096];
         SP* e = &sp[cur & 4095];
         if (e->tex == cur && e->m0 == want0 && e->m1 == want1) return;
@@ -433,6 +509,11 @@ params:;
         GLint f = lin ? GL_LINEAR : GL_NEAREST;
         if (levels > 1 && mip) f = lin ? (mip == 2 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST) : (mip == 2 ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+        {   /* anisotropic filtering (options): only for filtered, mipmapped textures, as on PC games */
+            extern int g_aniso; if (g_aniso_max < 0) { GLfloat m = 1; glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &m); g_aniso_max = (int)m; while (glGetError()) ; }
+            float a = (lin && levels > 1 && mip && g_aniso > 1) ? (float)(g_aniso < g_aniso_max ? g_aniso : g_aniso_max) : 1.f;
+            if (g_aniso_max > 1) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, a);
+        }
         if (levels > 1) {
             int b = map < 4 ? map : map - 4 + 0x20; u32 m1 = gx_bp_regs()[0x84 + b];
             glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, (m1 & 0xFF) / 16.f);
@@ -471,7 +552,7 @@ void gl_flush(void) { if (!g_nv) return; u64 t = host_tb(); gl_flush_(); g_pf_fl
 static void gl_flush_(void) {
     u32* bp = gx_bp_regs();
     int fresh = !g_gs.valid || g_gs.scale != g_scale || g_gs.ws != g_ws;
-    if (fresh) { glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH); glUseProgram(g_prog); glBindVertexArray(g_vao); glBindBuffer(GL_ARRAY_BUFFER, g_vbo); }
+    if (fresh) { glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); glViewport(0, 0, SW, SH); glUseProgram(g_prog); glBindVertexArray(g_vao); glBindBuffer(GL_ARRAY_BUFFER, g_vbo); }
     /* skip re-uploading the shader constants when none of the registers they come from changed since the last draw */
     static u32 g_ulast[0x50 + 0x40 + 16 + 1]; static int g_uvalid; u32 ucur[0x50 + 0x40 + 16 + 1];
     { extern u32 g_tevcol[2][8]; memcpy(ucur, bp, 0x50 * 4); memcpy(ucur + 0x50, bp + 0xC0, 0x40 * 4); memcpy(ucur + 0x90, g_tevcol, 16 * 4); ucur[0xA0] = (u32)g_scale << 1 | (u32)g_ws; }
@@ -582,46 +663,47 @@ static void gl_flush_(void) {
         glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vbo_off, (GLsizeiptr)bytes, g_vb);
     }
     glDrawArrays(GL_TRIANGLES, (GLint)(vbo_off / (VSTRIDE * 4)), g_nv);
+    g_ms_dirty = 1;
     if (vbo_alloc) vbo_off += bytes;
     g_nv = 0;
 }
 
 /* read EFB region (y down) into RGBA8 buffer laid out EFB_W wide */
 void gl_read_efb(u32* dst, int x, int y, int w, int h) {
-    gl_flush(); gl_state_dirty(); u64 t0 = host_tb(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_SCISSOR_TEST);
+    gl_flush(); gl_state_dirty(); efb_resolve(); u64 t0 = host_tb(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_SCISSOR_TEST);
     if (SW != EFB_W || SH != EFB_H) {   /* downsample the scaled region to native size first */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_rfbo);
         glBlitFramebuffer(XS(x), YS(EFB_H - y - h), XS(x + w), YS(EFB_H - y), x, EFB_H - y - h, x + w, EFB_H - y, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         glBindFramebuffer(GL_FRAMEBUFFER, g_rfbo);
-    } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);   /* (resolved) */
     static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
     glReadPixels(x, EFB_H - y - h, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
     for (int r = 0; r < h; r++) memcpy(dst + (size_t)(y + r) * EFB_W + x, tmp + (size_t)(h - 1 - r) * w, (size_t)w * 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     g_pf_read += host_tb() - t0;
 }
 /* read EFB depth (24-bit) into a buffer laid out EFB_W wide */
 void gl_read_efb_depth(u32* dst, int x, int y, int w, int h) {
-    gl_flush(); gl_state_dirty(); glDisable(GL_SCISSOR_TEST);
+    gl_flush(); gl_state_dirty(); efb_resolve(); glDisable(GL_SCISSOR_TEST);
     if (SW != EFB_W || SH != EFB_H) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_rfbo);
         glBlitFramebuffer(XS(x), YS(EFB_H - y - h), XS(x + w), YS(EFB_H - y), x, EFB_H - y - h, x + w, EFB_H - y, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, g_rfbo);
-    } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    } else glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);   /* (resolved) */
     static u32* tmp; static int tn; if (w * h > tn) { tn = w * h; tmp = realloc(tmp, (size_t)tn * 4); }
     glReadPixels(x, EFB_H - y - h, w, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, tmp);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     for (int r = 0; r < h; r++) { const u32* s = tmp + (size_t)(h - 1 - r) * w; u32* d = dst + (size_t)(y + r) * EFB_W + x; for (int i = 0; i < w; i++) d[i] = s[i] >> 8; }
 }
 void gl_clear(int x, int y, int w, int h, u32 rgba, u32 z24, int color, int alpha, int depth) {
     gl_flush(); gl_state_dirty(); glDisable(GL_COLOR_LOGIC_OP); glDisable(GL_BLEND);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     glEnable(GL_SCISSOR_TEST); glScissor(XS(x), YS(EFB_H - y - h), XS(x + w) - XS(x), YS(h));
     glColorMask(color, color, color, alpha); glDepthMask(depth);
     glClearColor((rgba & 255) / 255.f, ((rgba >> 8) & 255) / 255.f, ((rgba >> 16) & 255) / 255.f, (rgba >> 24) / 255.f);
     glClearDepth(z24 / 16777215.0);
     glClear((color || alpha ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
-    glColorMask(1, 1, 1, 1);
+    glColorMask(1, 1, 1, 1); g_ms_dirty = 1;
 }
 
 static GLuint g_sfbo, g_stex;
@@ -683,14 +765,14 @@ void ui_text(float x, float y, float size, const char* s, const float* c) {
         x += g_uifont_adv[ch] * k;
     }
 }
-void ui_end(void) { ui_flush(); glDisable(GL_BLEND); glBindVertexArray(g_vao); glUseProgram(g_prog); glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH); }
+void ui_end(void) { ui_flush(); glDisable(GL_BLEND); glBindVertexArray(g_vao); glUseProgram(g_prog); glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); glViewport(0, 0, SW, SH); }
 /* the options screen draws itself into a 4:3 rectangle of the current framebuffer */
 WEAK void options_draw(float x, float y, float w, float h) { (void)x; (void)y; (void)w; (void)h; }
 WEAK int options_is_open(void) { return 0; }
 /* headless runs: draw the overlay into the EFB so frame dumps show it */
 void gl_overlay_into_efb(void) {
     if (!options_is_open()) return;
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
     ui_begin(SW, SH); { float h = 480.f * g_scale, w = h * 4 / 3; options_draw((SW - w) / 2, 0, w, h); } ui_end();
 }
 /* live resolution change: recreate the EFB at the new scale */
@@ -704,9 +786,43 @@ void gl_set_widescreen(int on) {
     gl_flush(); gl_state_dirty(); int ow = SW, oh = SH; g_ws = on; gl_resize_efb(ow, oh);
     rt_log("GL: widescreen %s\n", on ? "on" : "off");
 }
+static void ms_alloc(void) {   /* (re)create the multisampled EFB for the current size and sample count */
+    if (g_msaa <= 1) return;
+    if (!g_msfbo) { glGenFramebuffers(1, &g_msfbo); glGenRenderbuffers(1, &g_msc); glGenRenderbuffers(1, &g_msd); }
+    glBindRenderbuffer(GL_RENDERBUFFER, g_msc); glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_msaa, GL_RGBA8, SW, SH);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_msd); glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_msaa, GL_DEPTH_COMPONENT24, SW, SH);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_msfbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_msc);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_msd);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { rt_log("GL: %dx MSAA unavailable\n", g_msaa); g_msaa = 1; glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); return; }
+    /* start from the current picture */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_msfbo);
+    glBlitFramebuffer(0, 0, SW, SH, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_msfbo);
+}
+static void efb_resolve(void) {
+    if (g_msaa <= 1 || !g_ms_dirty) return;
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_msfbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbo);
+    glBlitFramebuffer(0, 0, SW, SH, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
+    g_ms_dirty = 0;
+}
+/* options: 1 (off), 2, 4 or 8 samples */
+void gl_set_msaa(int samples) {
+    if (samples < 1) samples = 1;
+    { GLint mx = 1; glGetIntegerv(GL_MAX_SAMPLES, &mx); if (samples > mx) samples = mx; }
+    if (samples == g_msaa) return;
+    gl_flush(); gl_state_dirty(); efb_resolve();
+    g_msaa = samples; ms_alloc(); g_ms_dirty = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
+    rt_log("GL: MSAA %dx\n", g_msaa);
+}
 static void gl_resize_efb(int ow, int oh) {
+    efb_resolve();
     glBindTexture(GL_TEXTURE_2D, g_fbtex); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
     glBindRenderbuffer(GL_RENDERBUFFER, g_fbdepth); glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, SW, SH);
+    ms_alloc();
     if (g_stex) {   /* keep the paused frame visible under the options screen: rescale it into a new texture */
         GLuint nt, nf; glGenTextures(1, &nt); glBindTexture(GL_TEXTURE_2D, nt); glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
         glGenFramebuffers(1, &nf); glBindFramebuffer(GL_FRAMEBUFFER, nf); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nt, 0);
@@ -715,14 +831,14 @@ static void gl_resize_efb(int ow, int oh) {
         glDeleteFramebuffers(1, &g_sfbo); glDeleteTextures(1, &g_stex); g_sfbo = nf; g_stex = nt;
     }
     glUseProgram(g_prog); glUniform1f(u_scale, (float)SW / EFB_W);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glViewport(0, 0, SW, SH);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO); glViewport(0, 0, SW, SH);
     rt_log("GL: internal resolution %dx%d\n", SW, 480 * g_scale);
 }
 
 /* frame interpolation: the real frame is kept in a texture while the in-between frame is shown */
 static int g_show_saved;
 void gl_save_real(void) {
-    gl_flush(); gl_state_dirty();
+    gl_flush(); gl_state_dirty(); efb_resolve();
     if (!g_sfbo) {
         glGenFramebuffers(1, &g_sfbo); glGenTextures(1, &g_stex); glBindTexture(GL_TEXTURE_2D, g_stex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SW, SH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
@@ -731,11 +847,27 @@ void gl_save_real(void) {
     glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_sfbo);
     glBlitFramebuffer(0, 0, SW, SH, 0, 0, SW, SH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
 }
 void gl_show_saved(int on) { g_show_saved = on; }
+/* F12: screenshot of the game picture at the internal resolution (no overlays) */
+void gl_take_screenshot(void) {
+    extern int g_shot_req; extern void screenshot_write(u8* rgba, int w, int h);
+    if (!g_shot_req) return;
+    g_shot_req = 0;
+    gl_flush(); efb_resolve();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
+    int y0 = YS(EFB_H - 480), sw = SW, sh = SH - y0;
+    u8* px = malloc((size_t)sw * sh * 4); u8* fl = malloc((size_t)sw * sh * 4);
+    if (px && fl) {
+        glReadPixels(0, y0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (int r = 0; r < sh; r++) memcpy(fl + (size_t)r * sw * 4, px + (size_t)(sh - 1 - r) * sw * 4, (size_t)sw * 4);
+        free(px); screenshot_write(fl, sw, sh);
+    } else { free(px); free(fl); }
+    gl_state_dirty();
+}
 void gl_blit_to_screen(int w, int h) {
-    gl_flush(); gl_state_dirty();
+    gl_flush(); gl_state_dirty(); efb_resolve();
     glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glViewport(0, 0, w, h); glClearColor(0, 0, 0, 1); glColorMask(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
@@ -744,6 +876,7 @@ void gl_blit_to_screen(int w, int h) {
     int dx = (w - dw) / 2, dy = (h - dh) / 2;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_show_saved && g_sfbo ? g_sfbo : g_fbo);
     glBlitFramebuffer(0, YS(EFB_H - 480), SW, SH, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    gl_take_screenshot();
     if (options_is_open()) { glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h); float ow = dh * 4.f / 3.f; options_draw(dx + (dw - ow) / 2, (float)(h - dy - dh), ow, (float)dh); ui_end(); }
     { extern int g_perf_overlay; extern char g_perf_text[3][200];
       if (g_perf_overlay && g_perf_text[0][0]) {   /* F3: performance readout, top left */
@@ -755,5 +888,23 @@ void gl_blit_to_screen(int w, int h) {
           for (int i = 0; i < 3; i++) ui_text(2 * pad, 2 * pad + i * lh, sz, g_perf_text[i], i == 0 ? gold : white);
           ui_end();
       } }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    {   /* on-screen messages, bottom left */
+        extern int osd_get(int k, const char** text, float* alpha);
+        const char* t; float al;
+        if (osd_get(0, &t, &al)) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0); ui_begin(w, h);
+            float sz = h / 40.f; if (sz < 14) sz = 14; float pad = sz * 0.6f, lh = sz * 1.5f;
+            int n = 0; while (n < 4 && osd_get(n, &t, &al)) n++;
+            for (int k = 0; k < n; k++) {
+                osd_get(k, &t, &al);
+                float y = h - pad - (n - k) * lh, tw = ui_text_width(t, sz);
+                float bg[4] = {0.02f, 0.06f, 0.22f, 0.75f * al}, rim[4] = {0.62f, 0.78f, 1.f, 0.8f * al}, fg[4] = {1, 1, 1, al};
+                ui_rect(pad - 2, y - 2, tw + 2 * pad + 4, lh - sz * 0.2f + 4, rim, rim);
+                ui_rect(pad, y, tw + 2 * pad, lh - sz * 0.2f, bg, bg);
+                ui_text(2 * pad, y + sz * 0.1f, sz, t, fg);
+            }
+            ui_end();
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, DRAWFBO);
 }
